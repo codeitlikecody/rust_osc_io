@@ -1,41 +1,72 @@
 use rosc::OscType;
-use rust_osc_io::{GROUP, PORT, create_sender_socket, send_osc, start_receiver};
+use rust_osc_io::{GROUP, OscWorkerHandle, PORT};
 use std::io;
 use std::io::prelude::*;
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
-fn main() {
-    let _receiver_thread = start_receiver(GROUP, PORT, |sender, packet| {
-        println!("RECEIVER: Received from {sender}: {packet:?}");
-    })
-    .unwrap();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Try to start the receiver but don't crash if it fails; continue without receiver.
+    let multicast_group = Some(GROUP);
+    let listener_ip = Some(Ipv4Addr::UNSPECIFIED);
+    let listener_port = Some(PORT);
+    let sender_ip = Some(Ipv4Addr::UNSPECIFIED);
+    let sender_port = Some(0);
+    let osc_worker_handle = match OscWorkerHandle::spawn(
+        multicast_group,
+        listener_ip,
+        listener_port,
+        sender_ip,
+        sender_port,
+        |sender, packet| {
+            println!("WORKER: Received from {sender}: {packet:?}");
+        },
+    ) {
+        Ok(handle) => {
+            println!("Worker started");
+            handle
+        }
+        Err(err) => {
+            eprintln!("Failed to start worker. Exiting program...");
+            return Err(Box::new(err));
+        }
+    };
 
     let stdin = io::stdin();
-    let client1 = create_sender_socket().unwrap();
+
     loop {
         print!("Input text: ");
-        io::stdout().flush().unwrap();
+        if let Err(err) = io::stdout().flush() {
+            eprintln!("Warning: failed to flush stdout: {}. Continuing.", err);
+        }
+
         let mut input = String::new();
-        if stdin.read_line(&mut input).unwrap() == 0 {
-            break; // Handle EOF (e.g., Ctrl+D or Ctrl+Z)
+        match stdin.read_line(&mut input) {
+            Ok(0) => {
+                println!("EOF; exiting input loop.");
+                break;
+            }
+            Ok(_) => { /* proceed */ }
+            Err(err) => {
+                eprintln!("Failed to read input: {}. Continuing.", err);
+                continue;
+            }
         }
 
         let trimmed = input.trim();
-
         println!("Sending: {}", trimmed);
-        match send_osc(
-            &client1,
-            SocketAddrV4::new(GROUP, PORT),
+        osc_worker_handle.send_message(
             "/messenger/me/say",
             vec![OscType::String(trimmed.to_string())],
-        ) {
-            Ok(n) => println!("SENDER: Sent {n} bytes OK."),
-            Err(err) => println!("SENDER: Error sending OSC: {err}"),
-        }
+        )?;
 
         if trimmed == "x" {
             println!("Exiting...");
             break;
         }
     }
+
+    osc_worker_handle.stop_osc_worker()?;
+
+    println!("Main loop ended; program exiting (worker thread may still be running).");
+    Ok(())
 }

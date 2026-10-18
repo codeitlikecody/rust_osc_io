@@ -2,10 +2,8 @@ pub use rosc::OscError;
 use rosc::{OscMessage, OscPacket, OscType, decoder, encoder};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::sync::mpsc::{self, SendError};
+use std::sync::mpsc::{self};
 use std::thread::{self, JoinHandle};
-
-use crate::OscWorkerError::IoError;
 
 // Default network configuration for the OSC Messenger standard client 1
 pub const GROUP: Ipv4Addr = Ipv4Addr::new(239, 254, 0, 1);
@@ -20,7 +18,8 @@ pub enum OscWorkerError {
 pub enum OscWorkerEvent {
     Started,
     Stopped,
-    MessageSent(usize),    // Number of bytes sent
+    MessageSent(usize),
+    MessageReceived(SocketAddr, OscPacket),
     Error(OscWorkerError), // Error event can be used to report non fatal errors from the worker thread to the main thread.
 }
 #[derive(Debug)]
@@ -115,19 +114,20 @@ impl OscWorkerHandle {
         })
     }
 
+    /// Returns a reference to the receiver for events from the worker thread.
+    pub fn events(&self) -> &mpsc::Receiver<OscWorkerEvent> {
+        &self.events
+    }
+
     /// Sends a command to the worker thread to stop it.
     /// Returns an io::Error if the worker thread has already stopped.
     pub fn stop_osc_worker(&self) -> Result<(), io::Error> {
         match self.commands.send(OscCommand::Stop) {
             Ok(()) => Ok(()),
-            Err(error) => {
-                // Err(error)
-                // make a general error message to return since caller can't access SendError<OscCommand> due to OscCommand being private
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to send stop command to worker thread: {error}"),
-                ))
-            }
+            Err(error) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to send stop command to worker thread: {error}"),
+            )),
         }
     }
 

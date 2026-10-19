@@ -17,9 +17,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener_port,
         sender_ip,
         sender_port,
-        |sender, packet| {
-            println!("WORKER: Received from {sender}: {packet:?}");
-        },
+        // |sender, packet| {
+        //     println!("WORKER: Received from {sender}: {packet:?}");
+        // },
     ) {
         Ok(handle) => {
             println!("Worker started");

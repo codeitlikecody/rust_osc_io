@@ -2,6 +2,7 @@ pub use rosc::OscError;
 use rosc::{OscMessage, OscPacket, OscType, decoder, encoder};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::ops::ControlFlow;
 use std::sync::mpsc::{self};
 use std::thread::{self, JoinHandle};
 
@@ -45,17 +46,13 @@ impl OscWorkerHandle {
     /// Spawns a receiver thread that listens for OSC packets on the given multicast `group` and `port`.
     /// If `group` or `port` is None, the default values of GROUP and PORT will be used.
     /// If `ip` is None, the default value of Ipv4Addr::UNSPECIFIED will be used.
-    pub fn spawn<F>(
+    pub fn spawn(
         multicast_group: Option<Ipv4Addr>,
         listener_ip: Option<Ipv4Addr>,
         listener_port: Option<u16>,
         sender_ip: Option<Ipv4Addr>,
         sender_port: Option<u16>,
-        handler: F,
-    ) -> Result<OscWorkerHandle, io::Error>
-    where
-        F: FnMut(SocketAddr, OscPacket) + Send + 'static,
-    {
+    ) -> Result<OscWorkerHandle, io::Error> {
         // Use the provided group, port, and ip, or fall back to protocol defaults if None.
         let multicast_group = multicast_group.unwrap_or(GROUP);
         let listener_ip = listener_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
@@ -75,8 +72,7 @@ impl OscWorkerHandle {
                 sender_port,
                 commands_rx,
                 events_tx,
-                handler,
-            );
+            )
         });
 
         // check for events from the receiver thread and make sure we were able to start the receiver thread successfully
@@ -156,10 +152,13 @@ impl OscWorkerHandle {
 ///
 /// # Arguments
 /// * `multicast_group` - The multicast group to receive packets on.
-/// * `listener_port` - The port to listen on.
 /// * `listener_ip` - The IP address to bind to.
-/// * `send_port` - The port to send from.
-fn spawn_osc_worker<F>(
+/// * `listener_port` - The port to listen on.
+/// * `sender_ip` - The IP address to send from.
+/// * `sender_port` - The port to send from.
+/// * `commands` - A channel to receive commands from the main thread.
+/// * `events` - A channel to send events to the main thread.
+fn spawn_osc_worker(
     multicast_group: Ipv4Addr,
     listener_ip: Ipv4Addr,
     listener_port: u16,
@@ -167,14 +166,12 @@ fn spawn_osc_worker<F>(
     sender_port: u16,
     commands: mpsc::Receiver<OscCommand>,
     events: mpsc::Sender<OscWorkerEvent>,
-    mut handler: F,
-) -> ()
-where
-    F: FnMut(SocketAddr, OscPacket) + Send + 'static,
-{
+) -> () {
     let mut buffer = [0u8; 65536];
-
-    let socket = match create_receiver_socket(multicast_group, listener_ip, listener_port) {
+    let listener_address = SocketAddrV4::new(listener_ip, listener_port);
+    let sender_address = SocketAddrV4::new(sender_ip, sender_port);
+    let destination = SocketAddrV4::new(multicast_group, listener_port);
+    let socket = match create_receiver_socket(multicast_group, listener_address) {
         Ok(socket) => socket,
         Err(error) => {
             eprintln!("WORKER: Failed to create receiver socket: {error}");
@@ -197,48 +194,22 @@ where
     loop {
         // Check for commands from the main thread
         match commands.try_recv() {
-            Ok(command) => {
-                match command {
-                    OscCommand::Stop => {
-                        break;
-                    }
-                    OscCommand::SendMessage(osc_address, osc_args) => {
-                        // Create a sender socket to send the message
-                        let sender_socket = match create_sender_socket(sender_ip, sender_port) {
-                            Ok(socket) => socket,
-                            Err(error) => {
-                                eprintln!("WORKER: Failed to create sender socket: {error}");
-                                events
-                                    .send(OscWorkerEvent::Error(OscWorkerError::IoError(error)))
-                                    .unwrap_or_else(|e| {
-                                        eprintln!("WORKER: Failed to send error event: {e}")
-                                    });
-                                continue;
-                            }
-                        };
-
-                        // Send the message to the multicast group and port
-                        let destination = SocketAddrV4::new(multicast_group, listener_port);
-                        match send_osc(&sender_socket, destination, &osc_address, osc_args) {
-                            Ok(bytes_sent) => {
-                                events
-                                    .send(OscWorkerEvent::MessageSent(bytes_sent))
-                                    .unwrap_or_else(|e| {
-                                        eprintln!("WORKER: Failed to send message sent event: {e}")
-                                    });
-                            }
-                            Err(error) => {
-                                eprintln!("WORKER: Failed to send OSC message: {error}");
-                                events
-                                    .send(OscWorkerEvent::Error(OscWorkerError::IoError(error)))
-                                    .unwrap_or_else(|e| {
-                                        eprintln!("WORKER: Failed to send error event: {e}")
-                                    });
-                            }
-                        }
+            Ok(command) => match command {
+                OscCommand::Stop => {
+                    break;
+                }
+                OscCommand::SendMessage(osc_address, osc_args) => {
+                    if let ControlFlow::Break(_) = send_osc_message(
+                        destination,
+                        sender_address,
+                        &events,
+                        osc_address,
+                        osc_args,
+                    ) {
+                        continue;
                     }
                 }
-            }
+            },
             Err(mpsc::TryRecvError::Empty) => {
                 // No command received, continue to receive OSC packets
             }
@@ -256,7 +227,14 @@ where
         // Receive an OSC packet from the socket
         match socket.recv_from(&mut buffer) {
             Ok((size, sender)) => match decoder::decode_udp(&buffer[..size]) {
-                Ok((_, packet)) => handler(sender, packet),
+                Ok((_, packet)) => {
+                    events
+                        .send(OscWorkerEvent::MessageReceived(sender, packet))
+                        .unwrap_or_else(|e| {
+                            eprintln!("WORKER: Failed to send mesage received event: {e}")
+                        });
+                }
+
                 Err(error) => {
                     eprintln!("WORKER: Failed to decode OSC packet: {error}");
                     events
@@ -282,25 +260,58 @@ where
     }
 }
 
+fn send_osc_message(
+    destination_address: SocketAddrV4,
+    sender_address: SocketAddrV4,
+    events: &mpsc::Sender<OscWorkerEvent>,
+    osc_address: String,
+    osc_args: Vec<OscType>,
+) -> ControlFlow<()> {
+    let sender_socket = match create_sender_socket(sender_address) {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("WORKER: Failed to create sender socket: {error}");
+            events
+                .send(OscWorkerEvent::Error(OscWorkerError::IoError(error)))
+                .unwrap_or_else(|e| eprintln!("WORKER: Failed to send error event: {e}"));
+            return ControlFlow::Break(());
+        }
+    };
+    // Create a sender socket to send the message
+
+    // Send the message to the multicast group and port
+    match send_osc(&sender_socket, destination_address, &osc_address, osc_args) {
+        Ok(bytes_sent) => {
+            events
+                .send(OscWorkerEvent::MessageSent(bytes_sent))
+                .unwrap_or_else(|e| eprintln!("WORKER: Failed to send message sent event: {e}"));
+        }
+        Err(error) => {
+            eprintln!("WORKER: Failed to send OSC message: {error}");
+            events
+                .send(OscWorkerEvent::Error(OscWorkerError::IoError(error)))
+                .unwrap_or_else(|e| eprintln!("WORKER: Failed to send error event: {e}"));
+        }
+    }
+    ControlFlow::Continue(())
+}
+
 /// Binds a UDP socket on `port` and joins the multicast `group` (with loopback enabled).
 /// # Arguments
 /// * `multicast_group` - The multicast group to join.
-/// * `listener_ip` - The IP address to listen on.
-/// * `listener_port` - The port to listen on.
+/// * `listener_address` - The address to listen on.
 pub fn create_receiver_socket(
     multicast_group: Ipv4Addr,
-    listener_ip: Ipv4Addr,
-    listener_port: u16,
+    listener_address: SocketAddrV4,
 ) -> Result<UdpSocket, io::Error> {
-    let socket = UdpSocket::bind((listener_ip.to_string().as_str(), listener_port))?;
-    socket.join_multicast_v4(&multicast_group, &listener_ip)?;
+    let socket = UdpSocket::bind(listener_address)?;
+    socket.join_multicast_v4(&multicast_group, &listener_address.ip())?;
     socket.set_multicast_loop_v4(true)?;
     Ok(socket)
 }
-
-/// Creates an ephemeral-port socket for sending.
-pub fn create_sender_socket(sender_ip: Ipv4Addr, sender_port: u16) -> io::Result<UdpSocket> {
-    UdpSocket::bind(sender_ip.to_string() + ":" + sender_port.to_string().as_str()).map(|socket| {
+/// * `sender_address` - The address to send the message from.
+pub fn create_sender_socket(sender_address: SocketAddrV4) -> io::Result<UdpSocket> {
+    UdpSocket::bind(sender_address).map(|socket| {
         socket.set_multicast_loop_v4(true).unwrap();
         socket
     })

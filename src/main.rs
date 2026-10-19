@@ -1,5 +1,5 @@
 use rust_osc_io::config::Config;
-use rust_osc_io::{OscWorkerEvent, OscWorkerHandle};
+use rust_osc_io::worker::{OscWorkerEvent, OscWorkerHandle};
 use std::error::Error;
 use std::io;
 use std::io::prelude::*;

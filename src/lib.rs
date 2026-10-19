@@ -48,17 +48,14 @@ impl OscWorkerHandle {
     /// If `ip` is None, the default value of Ipv4Addr::UNSPECIFIED will be used.
     pub fn spawn(
         multicast_group: Option<Ipv4Addr>,
-        listener_ip: Option<Ipv4Addr>,
-        listener_port: Option<u16>,
-        sender_ip: Option<Ipv4Addr>,
-        sender_port: Option<u16>,
+        listener_address: Option<SocketAddrV4>,
+        sender_address: Option<SocketAddrV4>,
     ) -> Result<OscWorkerHandle, io::Error> {
         // Use the provided group, port, and ip, or fall back to protocol defaults if None.
         let multicast_group = multicast_group.unwrap_or(GROUP);
-        let listener_ip = listener_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
-        let listener_port = listener_port.unwrap_or(PORT);
-        let sender_ip = sender_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
-        let sender_port = sender_port.unwrap_or(0);
+        let listener_address =
+            listener_address.unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, PORT));
+        let sender_address = sender_address.unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
         // Create a channel for controlling the receiver
         let (commands_tx, commands_rx) = mpsc::channel::<OscCommand>();
@@ -66,10 +63,8 @@ impl OscWorkerHandle {
         let thread = thread::spawn(move || {
             spawn_osc_worker(
                 multicast_group,
-                listener_ip,
-                listener_port,
-                sender_ip,
-                sender_port,
+                listener_address,
+                sender_address,
                 commands_rx,
                 events_tx,
             )
@@ -111,7 +106,7 @@ impl OscWorkerHandle {
     }
 
     /// Returns a reference to the receiver for events from the worker thread.
-    pub fn events(&self) -> &mpsc::Receiver<OscWorkerEvent> {
+    pub fn event_receiver(&self) -> &mpsc::Receiver<OscWorkerEvent> {
         &self.events
     }
 
@@ -129,7 +124,7 @@ impl OscWorkerHandle {
 
     /// Sends a message to the worker thread.
     /// Returns an io::Error if the worker thread has already stopped.
-    pub fn send_message(&self, osc_address: &str, osc_args: Vec<OscType>) -> Result<(), io::Error> {
+    pub fn send_osc(&self, osc_address: &str, osc_args: Vec<OscType>) -> Result<(), io::Error> {
         match self
             .commands
             .send(OscCommand::SendMessage(osc_address.to_string(), osc_args))
@@ -160,17 +155,13 @@ impl OscWorkerHandle {
 /// * `events` - A channel to send events to the main thread.
 fn spawn_osc_worker(
     multicast_group: Ipv4Addr,
-    listener_ip: Ipv4Addr,
-    listener_port: u16,
-    sender_ip: Ipv4Addr,
-    sender_port: u16,
+    listener_address: SocketAddrV4,
+    sender_address: SocketAddrV4,
     commands: mpsc::Receiver<OscCommand>,
     events: mpsc::Sender<OscWorkerEvent>,
 ) -> () {
     let mut buffer = [0u8; 65536];
-    let listener_address = SocketAddrV4::new(listener_ip, listener_port);
-    let sender_address = SocketAddrV4::new(sender_ip, sender_port);
-    let destination = SocketAddrV4::new(multicast_group, listener_port);
+    let destination = SocketAddrV4::new(multicast_group, listener_address.port());
     let socket = match create_receiver_socket(multicast_group, listener_address) {
         Ok(socket) => socket,
         Err(error) => {
@@ -181,7 +172,6 @@ fn spawn_osc_worker(
             return;
         }
     };
-
     // set a read timeout so that the thread can check for commands from the main thread periodically
     socket
         .set_read_timeout(Some(std::time::Duration::from_millis(100)))
@@ -215,6 +205,8 @@ fn spawn_osc_worker(
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 // The main thread has disconnected, stop the receiver
+                leave_multicast_group(&socket, multicast_group, listener_address.ip())
+                    .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
                 events
                     .send(OscWorkerEvent::Error(OscWorkerError::IoError(
                         io::Error::new(io::ErrorKind::ConnectionReset, "Main thread disconnected"),
@@ -300,7 +292,7 @@ fn send_osc_message(
 /// # Arguments
 /// * `multicast_group` - The multicast group to join.
 /// * `listener_address` - The address to listen on.
-pub fn create_receiver_socket(
+fn create_receiver_socket(
     multicast_group: Ipv4Addr,
     listener_address: SocketAddrV4,
 ) -> Result<UdpSocket, io::Error> {
@@ -309,8 +301,23 @@ pub fn create_receiver_socket(
     socket.set_multicast_loop_v4(true)?;
     Ok(socket)
 }
+
+/// Leaves the multicast group and closes the socket.
+/// # Arguments
+/// * `socket` - The UDP socket to leave the multicast group on.
+/// * `multicast_group` - The multicast group to leave.
+/// * `interface` - The network interface to use.
+fn leave_multicast_group(
+    socket: &UdpSocket,
+    multicast_group: Ipv4Addr,
+    interface: &Ipv4Addr,
+) -> Result<(), io::Error> {
+    socket.leave_multicast_v4(&multicast_group, interface)?;
+    Ok(())
+}
+
 /// * `sender_address` - The address to send the message from.
-pub fn create_sender_socket(sender_address: SocketAddrV4) -> io::Result<UdpSocket> {
+fn create_sender_socket(sender_address: SocketAddrV4) -> io::Result<UdpSocket> {
     UdpSocket::bind(sender_address).map(|socket| {
         socket.set_multicast_loop_v4(true).unwrap();
         socket
@@ -318,7 +325,7 @@ pub fn create_sender_socket(sender_address: SocketAddrV4) -> io::Result<UdpSocke
 }
 
 /// Encodes and sends an OSC message to `destination_ip`; returns bytes sent.
-pub fn send_osc(
+fn send_osc(
     socket: &UdpSocket,
     destination_ip: SocketAddrV4,
     osc_address: &str,

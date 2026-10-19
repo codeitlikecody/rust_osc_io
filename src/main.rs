@@ -1,22 +1,19 @@
 use rosc::OscType;
 use rust_osc_io::{GROUP, OscWorkerEvent, OscWorkerHandle, PORT};
+use std::error::Error;
 use std::io;
 use std::io::prelude::*;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Try to start the receiver but don't crash if it fails; continue without receiver.
     let multicast_group = Some(GROUP);
-    let listener_ip = Some(Ipv4Addr::UNSPECIFIED);
-    let listener_port = Some(PORT);
-    let sender_ip = Some(Ipv4Addr::UNSPECIFIED);
-    let sender_port = Some(0);
+    let listener_address = Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, PORT));
+    let sender_address = Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
     let osc_worker_handle = match OscWorkerHandle::spawn(
         multicast_group,
-        listener_ip,
-        listener_port,
-        sender_ip,
-        sender_port,
+        listener_address,
+        sender_address,
         // |sender, packet| {
         //     println!("WORKER: Received from {sender}: {packet:?}");
         // },
@@ -58,39 +55,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         } else {
             println!("Sending: {}", trimmed);
-            osc_worker_handle.send_message(
+            osc_worker_handle.send_osc(
                 "/messenger/me/say",
                 vec![OscType::String(trimmed.to_string())],
             )?;
         }
 
-        // check for events from the receiver thread to make sure we have successfully sent the message and that the receiver thread is running. This
-        // should not be blocking, since the receiver thread should send an event immediately after starting
-        // If we don't receive an event within a reasonable time, we should fail.
-
-        match osc_worker_handle
-            .events()
-            .recv_timeout(std::time::Duration::from_secs(5))
-        {
-            Ok(OscWorkerEvent::Started) => {
-                println!("CLIENT: OSC worker thread has been started.");
-            }
-            Ok(OscWorkerEvent::Stopped) => {
-                println!("CLIENT: OSC worker thread has stopped. Exiting...");
-                return Ok(());
-            }
-            Ok(OscWorkerEvent::MessageReceived(sender, packet)) => {
-                println!("CLIENT: Message received from {sender}: {packet:?}");
-            }
-            Ok(OscWorkerEvent::MessageSent(size)) => {
-                println!("CLIENT: Message sent. {size} bytes sent successfully.");
-            }
-
-            Ok(OscWorkerEvent::Error(error)) => {
-                eprintln!("CLIENT: OSC worker thread error: {error:?}");
-            }
-            Err(error) => {
-                eprintln!("CLIENT: Failed to receive event from worker thread: {error}");
+        // Check for messages from the worker thread. Make shure to check for all messages, since the worker thread may have sent multiple messages since the last time we checked. If we don't check for messages, the worker thread may block when trying to send a message to the main thread, which will cause the worker thread to stop responding.
+        while let Ok(message) = check_for_messages(&osc_worker_handle) {
+            match message {
+                OscWorkerEvent::Stopped => {
+                    println!("Worker thread has stopped. Exiting input loop.");
+                    break;
+                }
+                _ => {}
             }
         }
     }
@@ -99,4 +77,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Main loop ended; program exiting (worker thread may still be running).");
     Ok(())
+}
+
+fn check_for_messages(
+    osc_worker_handle: &OscWorkerHandle,
+) -> Result<OscWorkerEvent, Box<dyn Error>> {
+    // check for events from the receiver thread to make sure we have successfully sent the message and that the receiver thread is running. This
+    // should not be blocking, since the receiver thread should send an event immediately after starting
+    // If we don't receive an event within a reasonable time, we should fail.
+
+    match osc_worker_handle
+        .event_receiver()
+        .recv_timeout(std::time::Duration::from_millis(200))
+    {
+        Ok(OscWorkerEvent::Started) => {
+            println!("MESSAGE RECEIVED: OSC worker thread has been started.");
+            return Ok(OscWorkerEvent::Started);
+        }
+        Ok(OscWorkerEvent::Stopped) => {
+            println!("MESSAGE RECEIVED: OSC worker thread has stopped. Exiting...");
+            return Ok(OscWorkerEvent::Stopped);
+        }
+        Ok(OscWorkerEvent::MessageReceived(sender, packet)) => {
+            println!("MESSAGE RECEIVED: Message received from {sender}: {packet:?}");
+            return Ok(OscWorkerEvent::MessageReceived(sender, packet));
+        }
+        Ok(OscWorkerEvent::MessageSent(size)) => {
+            println!("MESSAGE RECEIVED: Message sent. {size} bytes sent successfully.");
+            return Ok(OscWorkerEvent::MessageSent(size));
+        }
+        Ok(OscWorkerEvent::Error(error)) => {
+            eprintln!("MESSAGE RECEIVED: OSC worker thread error: {error:?}");
+            return Ok(OscWorkerEvent::Error(error));
+        }
+        Err(error) => {
+            eprintln!("No messages in queue: {error}");
+            return Err(Box::new(error));
+        }
+    }
 }

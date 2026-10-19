@@ -1,10 +1,13 @@
 pub mod config;
+pub mod net;
 pub mod protocol;
+
+use net::{create_receiver_socket, create_sender_socket, leave_multicast_group};
 use protocol::{Me, Message, MessengerClient, Say};
 pub use rosc::OscError;
 use rosc::{decoder, encoder};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::ops::ControlFlow;
 use std::sync::mpsc::{self};
 use std::thread::{self, JoinHandle};
@@ -315,40 +318,4 @@ fn send_osc_message(
     }
 
     ControlFlow::Continue(())
-}
-
-/// Binds a UDP socket on `port` and joins the multicast `group` (with loopback enabled).
-/// # Arguments
-/// * `multicast_group` - The multicast group to join.
-/// * `listener_address` - The address to listen on.
-fn create_receiver_socket(
-    multicast_group: Ipv4Addr,
-    listener_address: SocketAddrV4,
-) -> Result<UdpSocket, io::Error> {
-    let socket = UdpSocket::bind(listener_address)?;
-    socket.join_multicast_v4(&multicast_group, &listener_address.ip())?;
-    socket.set_multicast_loop_v4(true)?;
-    Ok(socket)
-}
-
-/// Leaves the multicast group and closes the socket.
-/// # Arguments
-/// * `socket` - The UDP socket to leave the multicast group on.
-/// * `multicast_group` - The multicast group to leave.
-/// * `interface` - The network interface to use.
-fn leave_multicast_group(
-    socket: &UdpSocket,
-    multicast_group: Ipv4Addr,
-    interface: &Ipv4Addr,
-) -> Result<(), io::Error> {
-    socket.leave_multicast_v4(&multicast_group, interface)?;
-    Ok(())
-}
-
-/// * `sender_address` - The address to send the message from.
-fn create_sender_socket(sender_address: SocketAddrV4) -> io::Result<UdpSocket> {
-    UdpSocket::bind(sender_address).map(|socket| {
-        socket.set_multicast_loop_v4(true).unwrap();
-        socket
-    })
 }

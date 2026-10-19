@@ -10,27 +10,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let multicast_group = Some(GROUP);
     let listener_address = Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, PORT));
     let sender_address = Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-    let osc_worker_handle = match OscWorkerHandle::spawn(
-        multicast_group,
-        listener_address,
-        sender_address,
-        // |sender, packet| {
-        //     println!("WORKER: Received from {sender}: {packet:?}");
-        // },
-    ) {
-        Ok(handle) => {
-            println!("Worker started");
-            handle
-        }
-        Err(err) => {
-            eprintln!("Failed to start worker. Exiting program...");
-            return Err(Box::new(err));
-        }
-    };
+    let name = Some("Test client 1".into());
+    let osc_worker_handle =
+        match OscWorkerHandle::spawn(multicast_group, listener_address, sender_address, name) {
+            Ok(handle) => {
+                println!("Worker started");
+                handle
+            }
+            Err(err) => {
+                eprintln!("Failed to start worker. Exiting program...");
+                return Err(Box::new(err));
+            }
+        };
 
     let stdin = io::stdin();
 
     loop {
+        // Check for messages from the worker thread. Make sure to check for all messages, since the worker thread may have sent multiple messages since the last time we checked. If we don't check for messages, the worker thread may block when trying to send a message to the main thread, which will cause the worker thread to stop responding.
+        while let Ok(message) = check_for_messages(&osc_worker_handle) {
+            match message {
+                OscWorkerEvent::Stopped => {
+                    println!("Worker thread has stopped. Exiting input loop.");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // Prompt the user for input and send it to the worker thread. If the user enters "x", exit the loop and stop the worker thread.
         print!("Input text: ");
         if let Err(err) = io::stdout().flush() {
             eprintln!("Warning: failed to flush stdout: {}. Continuing.", err);
@@ -55,28 +62,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         } else {
             println!("Sending: {}", trimmed);
-            osc_worker_handle.send_osc(
-                "/messenger/me/say",
-                vec![OscType::String(trimmed.to_string())],
-            )?;
-        }
-
-        // Check for messages from the worker thread. Make shure to check for all messages, since the worker thread may have sent multiple messages since the last time we checked. If we don't check for messages, the worker thread may block when trying to send a message to the main thread, which will cause the worker thread to stop responding.
-        while let Ok(message) = check_for_messages(&osc_worker_handle) {
-            match message {
-                OscWorkerEvent::Stopped => {
-                    println!("Worker thread has stopped. Exiting input loop.");
-                    break;
-                }
-                _ => {}
-            }
+            osc_worker_handle.say(trimmed.to_string())?;
         }
     }
 
-    osc_worker_handle.stop_osc_worker()?;
-
-    println!("Main loop ended; program exiting (worker thread may still be running).");
-    Ok(())
+    match osc_worker_handle.stop_osc_worker() {
+        Ok(_) => {
+            println!("Worker thread stopped successfully. Program exiting...");
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("Failed to stop worker: {error}");
+            println!("Program exiting...");
+            Err(Box::new(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to stop worker thread",
+            )))
+        }
+    }
 }
 
 fn check_for_messages(

@@ -1,129 +1,61 @@
+pub mod config;
+pub mod protocol;
+use protocol::{Me, Message, MessengerClient, Say};
 pub use rosc::OscError;
-use rosc::{OscMessage, OscPacket, OscType, decoder, encoder};
+use rosc::{decoder, encoder};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::ops::ControlFlow;
 use std::sync::mpsc::{self};
 use std::thread::{self, JoinHandle};
 
-use crate::MeMessage::Introduce;
-
-// Default network configuration for the OSC Messenger standard client 1
-pub const GROUP: Ipv4Addr = Ipv4Addr::new(239, 254, 0, 1);
-pub const PORT: u16 = 3090;
-pub const APPLICATION_NAME: &str = "OSC Messenger Test Client v0.0.1";
-pub const CLIENT_NAME: &str = "Test client";
+use crate::Me::Introduce;
 
 #[derive(Debug)]
 pub enum OscWorkerError {
     IoError(io::Error),
     OscError(OscError),
+    MessengerProtocolError(protocol::MessengerProtocolError),
 }
 #[derive(Debug)]
 pub enum OscWorkerEvent {
     Started,
     Stopped,
     MessageSent(usize),
-    MessageReceived(SocketAddr, OscPacket),
+    MessageReceived(SocketAddr, Message),
     Error(OscWorkerError), // Error event can be used to report non fatal errors from the worker thread to the main thread.
 }
 #[derive(Debug)]
 enum OscCommand {
     Stop,
-    SendMessage(MessengerMessage),
+    SendMessage(Message),
     // Future commands can be added here, such as changing the broadcast group.
     // Changing port will need the socket to be recreated with the new port, so it may be better to just stop the worker and start a new one with the new port.
     // ChangeGroup(Ipv4Addr),
 }
 
 pub struct OscWorkerHandle {
-    commands: mpsc::Sender<OscCommand>,
-    events: mpsc::Receiver<OscWorkerEvent>,
+    commands_tx: mpsc::Sender<OscCommand>,
+    events_rx: mpsc::Receiver<OscWorkerEvent>,
     thread: JoinHandle<()>,
     client: MessengerClient,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MessengerMessage {
-    MeMessage(MeMessage),
-    WhoMessage(WhoMessage),
-}
-
-// enum that describes messages at the /messenger/who address
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WhoMessage {
-    Todo, // TODO
-}
-// enum that describes messages at the /messenger/me address
-// this could be a IntroduceMessage, WelcomeMessage, or a SayMessage, depending on the context of the message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MeMessage {
-    Introduce(MessengerClient),
-    Welcome(MessengerClient),
-    Say(SayMessage),
-}
-
-// enum that describes a messenger user
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MessengerClient {
-    client_uuid: String,
-    client_name: String,
-    application_name: String,
-}
-
-// enum that describes a say message
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SayMessage {
-    message_uuid: String,
-    client_uuid: String,
-    message: String,
-}
-
-impl MessengerMessage {
-    pub fn to_osc(&self) -> OscPacket {
-        let address = get_osc_address_from_message(self);
-        let args = get_osc_args_from_message(self);
-        OscPacket::Message(OscMessage {
-            addr: address.to_string(),
-            args,
-        })
-    }
-}
 /// A handle to a worker thread that can be used to control it.
 /// The worker thread will stop when the handle is dropped, but it can also be stopped explicitly by calling `stop_worker()`.
 /// The worker thread can be joined by calling `join()` on the handle.
 /// The worker thread will call the provided handler function for each received OSC packet, with the sender's address and the decoded OSC packet.
 impl OscWorkerHandle {
     /// Spawns a receiver thread that listens for OSC packets on the given multicast `group` and `port`.
-    /// If `group` or `port` is None, the default values of GROUP and PORT will be used.
-    /// If `ip` is None, the default value of Ipv4Addr::UNSPECIFIED will be used.
-    pub fn spawn(
-        multicast_group: Option<Ipv4Addr>,
-        listener_address: Option<SocketAddrV4>,
-        sender_address: Option<SocketAddrV4>,
-        client_name: Option<String>,
-    ) -> Result<OscWorkerHandle, io::Error> {
-        // Use the provided group, port, and ip, or fall back to protocol defaults if None.
-        let multicast_group = multicast_group.unwrap_or(GROUP);
-        let listener_address =
-            listener_address.unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, PORT));
-        let sender_address = sender_address.unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        let messenger_client = MessengerClient {
-            client_uuid: uuid::Uuid::new_v4().to_string(),
-            client_name: client_name.unwrap_or(CLIENT_NAME.to_string()),
-            application_name: APPLICATION_NAME.to_string(),
-        };
-
-        // Create a channel for controlling the receiver
+    pub fn spawn(config: config::Config) -> Result<OscWorkerHandle, io::Error> {
+        // Create channels for controlling the receiver and returning events
         let (commands_tx, commands_rx) = mpsc::channel::<OscCommand>();
         let (events_tx, events_rx) = mpsc::channel::<OscWorkerEvent>();
-        let thread_user = messenger_client.clone();
         let thread = thread::spawn(move || {
             spawn_osc_worker(
-                multicast_group,
-                listener_address,
-                sender_address,
-                thread_user,
+                config.multicast_group,
+                config.listener_address,
+                config.sender_address,
                 commands_rx,
                 events_tx,
             )
@@ -132,7 +64,7 @@ impl OscWorkerHandle {
         // check for events from the receiver thread and make sure we were able to start the receiver thread successfully
         // should not be blocking, since the receiver thread should send an event immediately after starting
         // If we don't receive an event within a reasonable time, we should fail.
-        match events_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        match events_rx.recv_timeout(config::DEFAULT_WORKER_START_TIMEOUT_MS) {
             Ok(OscWorkerEvent::Started) => {}
             Ok(OscWorkerEvent::Error(error)) => {
                 eprintln!("WORKER: Failed to start worker thread: {error:?}");
@@ -156,19 +88,17 @@ impl OscWorkerHandle {
                 ));
             }
         }
-
+        let client = MessengerClient::new(config.client_name, config.application_name);
         let handle = OscWorkerHandle {
-            commands: commands_tx,
-            events: events_rx,
+            commands_tx,
+            events_rx,
             thread,
-            client: messenger_client,
+            client,
         };
 
         // Introduce the client to the multicast group
         handle
-            .send_osc(MessengerMessage::MeMessage(Introduce(
-                handle.client.clone(),
-            )))
+            .send_osc(Message::Me(Introduce(handle.client.clone())))
             .unwrap_or_else(|e| eprintln!("WORKER: Failed to introduce client: {e}"));
 
         // Return the handle to the worker thread
@@ -177,13 +107,13 @@ impl OscWorkerHandle {
 
     /// Returns a reference to the receiver for events from the worker thread.
     pub fn event_receiver(&self) -> &mpsc::Receiver<OscWorkerEvent> {
-        &self.events
+        &self.events_rx
     }
 
     /// Sends a command to the worker thread to stop it.
     /// Returns an io::Error if the worker thread has already stopped.
     pub fn stop_osc_worker(&self) -> Result<(), io::Error> {
-        match self.commands.send(OscCommand::Stop) {
+        match self.commands_tx.send(OscCommand::Stop) {
             Ok(()) => Ok(()),
             Err(error) => Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -193,18 +123,17 @@ impl OscWorkerHandle {
     }
 
     /// Says a message to the multicast group.
-    pub fn say(&self, text: String) -> Result<(), io::Error> {
-        self.send_osc(MessengerMessage::MeMessage(MeMessage::Say(SayMessage {
-            message_uuid: uuid::Uuid::new_v4().to_string(),
-            client_uuid: self.client.client_uuid.clone(),
-            message: text,
-        })))
+    pub fn say(&self, message: String) -> Result<(), io::Error> {
+        self.send_osc(Message::Me(Me::Say(Say::new(
+            self.client.client_uuid().to_string(),
+            message,
+        ))))
     }
 
     /// Sends a message to the worker thread.
     /// Returns an io::Error if the worker thread has already stopped.
-    fn send_osc(&self, message: MessengerMessage) -> Result<(), io::Error> {
-        match self.commands.send(OscCommand::SendMessage(message)) {
+    fn send_osc(&self, message: Message) -> Result<(), io::Error> {
+        match self.commands_tx.send(OscCommand::SendMessage(message)) {
             Ok(()) => Ok(()),
             Err(error) => Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -223,17 +152,14 @@ impl OscWorkerHandle {
 ///
 /// # Arguments
 /// * `multicast_group` - The multicast group to receive packets on.
-/// * `listener_ip` - The IP address to bind to.
-/// * `listener_port` - The port to listen on.
-/// * `sender_ip` - The IP address to send from.
-/// * `sender_port` - The port to send from.
+/// * `listener_address` - The address to listen on.
+/// * `sender_address` - The address to send from.
 /// * `commands` - A channel to receive commands from the main thread.
 /// * `events` - A channel to send events to the main thread.
 fn spawn_osc_worker(
     multicast_group: Ipv4Addr,
     listener_address: SocketAddrV4,
     sender_address: SocketAddrV4,
-    messenger_user: MessengerClient,
     commands: mpsc::Receiver<OscCommand>,
     events: mpsc::Sender<OscWorkerEvent>,
 ) -> () {
@@ -299,11 +225,27 @@ fn spawn_osc_worker(
         match socket.recv_from(&mut buffer) {
             Ok((size, sender)) => match decoder::decode_udp(&buffer[..size]) {
                 Ok((_, packet)) => {
-                    events
-                        .send(OscWorkerEvent::MessageReceived(sender, packet))
-                        .unwrap_or_else(|e| {
-                            eprintln!("WORKER: Failed to send mesage received event: {e}")
-                        });
+                    match packet.try_into() {
+                        Ok(message) => {
+                            events
+                            .send(OscWorkerEvent::MessageReceived(sender, message))
+                            .unwrap_or_else(|e| {
+                                eprintln!("Worker Error 822: Failed to send message received event: {e}")
+                            });
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "Worker Error 971: Failed to convert OSC packet to Message. : {error}"
+                            );
+                            events
+                                .send(OscWorkerEvent::Error(
+                                    OscWorkerError::MessengerProtocolError(error),
+                                ))
+                                .unwrap_or_else(|e| {
+                                    eprintln!("WORKER: Failed to send error event: {e}")
+                                });
+                        }
+                    }
                 }
 
                 Err(error) => {
@@ -335,7 +277,7 @@ fn send_osc_message(
     destination_address: SocketAddrV4,
     sender_address: SocketAddrV4,
     events: &mpsc::Sender<OscWorkerEvent>,
-    message: MessengerMessage,
+    message: Message,
 ) -> ControlFlow<()> {
     let socket = match create_sender_socket(sender_address) {
         Ok(socket) => socket,
@@ -409,38 +351,4 @@ fn create_sender_socket(sender_address: SocketAddrV4) -> io::Result<UdpSocket> {
         socket.set_multicast_loop_v4(true).unwrap();
         socket
     })
-}
-
-fn get_osc_address_from_message(message: &MessengerMessage) -> &'static str {
-    match message {
-        MessengerMessage::MeMessage(me_message) => match me_message {
-            MeMessage::Introduce(_) => "/messenger/me/introduce",
-            MeMessage::Welcome(_) => "/messenger/me/welcome",
-            MeMessage::Say(_) => "/messenger/me/say",
-        },
-        MessengerMessage::WhoMessage(_) => "/messenger/who",
-    }
-}
-
-fn get_osc_args_from_message(message: &MessengerMessage) -> Vec<OscType> {
-    match message {
-        MessengerMessage::MeMessage(me_message) => match me_message {
-            MeMessage::Introduce(user) => vec![
-                OscType::String(user.client_uuid.clone()),
-                OscType::String(user.client_name.clone()),
-                OscType::String(user.application_name.clone()),
-            ],
-            MeMessage::Welcome(user) => vec![
-                OscType::String(user.client_uuid.clone()),
-                OscType::String(user.client_name.clone()),
-                OscType::String(user.application_name.clone()),
-            ],
-            MeMessage::Say(message) => vec![
-                OscType::String(message.message_uuid.clone()),
-                OscType::String(message.client_uuid.clone()),
-                OscType::String(message.message.clone()),
-            ],
-        },
-        MessengerMessage::WhoMessage(_) => vec![], // TODO
-    }
 }

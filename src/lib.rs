@@ -37,6 +37,22 @@ pub struct OscWorkerHandle {
     events: mpsc::Receiver<OscWorkerEvent>,
     thread: JoinHandle<()>,
 }
+// enum that describes messages at the /messenger/me address
+// this could be a IntroduceMessage, WelcomeMessage, or a SayMessage, depending on the context of the message.
+#[derive(Debug)]
+pub enum MeMessage {
+    Introduce(MessengerUser),
+    Welcome(MessengerUser),
+    Say(String),
+}
+
+// enum that describes a messenger user
+#[derive(Debug)]
+pub struct MessengerUser {
+    client_uuid: String,
+    client_name: String,
+    application_name: String,
+}
 
 /// A handle to a worker thread that can be used to control it.
 /// The worker thread will stop when the handle is dropped, but it can also be stopped explicitly by calling `stop_worker()`.

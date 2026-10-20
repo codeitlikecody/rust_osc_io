@@ -335,6 +335,7 @@ impl Say {
 /// tests
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use rosc::{OscBundle, OscTime};
 
     use super::*;
@@ -623,4 +624,84 @@ mod tests {
     }
 
     // TODO: Add tests for other message types and error cases as needed.
+
+    // Property-testing
+
+    /// Generates an arbitrary MessengerClient for property testing.
+    fn arb_client() -> impl Strategy<Value = MessengerClient> {
+        (any::<String>(), any::<String>(), any::<String>()).prop_map(|(u, n, a)| MessengerClient {
+            client_uuid: u,
+            client_name: n,
+            application_name: a,
+        })
+    }
+
+    /// Generates an arbitrary Say for property testing.
+    fn arb_say() -> impl Strategy<Value = Say> {
+        (any::<String>(), any::<String>(), any::<String>()).prop_map(|(m, c, t)| Say {
+            message_uuid: m,
+            client_uuid: c,
+            message: t,
+        })
+    }
+
+    /// Generates an arbitrary Message for property testing.
+    fn arb_message() -> impl Strategy<Value = Message> {
+        prop_oneof![
+            arb_client().prop_map(|c| Message::Me(Me::Introduce(c))),
+            arb_client().prop_map(|c| Message::Me(Me::Welcome(c))),
+            arb_say().prop_map(|s| Message::Me(Me::Say(s))),
+        ]
+    }
+
+    proptest! {
+        /// Tests that a Message can be converted to an OscPacket, encoded to osc and back without loss of information.
+        #[test]
+        fn message_round_trip(message in arb_message()) {
+            let packet = message.to_osc();
+            let encoded = rosc::encoder::encode(&packet).unwrap();
+            let (_, decoded_packet) = rosc::decoder::decode_udp(&encoded).unwrap();
+            let decoded_message = Message::try_from(decoded_packet).unwrap();
+            prop_assert_eq!(decoded_message, message);
+        }
+
+        /// Tests that MessengerClient::from_args handles arbitrary arg counts correctly, never panics and that wrong counts are an error.
+        #[test]
+        fn client_from_args_wrong_count_errors(n in 0usize..10) {
+            prop_assume!(n != 3);
+            let args = vec![OscType::String("x".into()); n];
+            prop_assert!(matches!(
+                MessengerClient::from_args(&args),
+                Err(MessengerProtocolError::InvalidArgumentCount(_))
+            ));
+        }
+
+        /// Tests that MessengerClient::from_args(&client.to_args()) handles arbitrary args correctly.
+        #[test]
+        fn client_from_args_round_trip(client in arb_client()) {
+            let args = client.to_args();
+            let reconstructed = MessengerClient::from_args(&args).unwrap();
+            prop_assert_eq!(reconstructed, client);
+        }
+
+        /// Tests that Say::from_args handles arbitrary arg counts correctly, never panics and that wrong counts are an error.
+        #[test]
+        fn say_from_args_wrong_count_errors(n in 0usize..10) {
+            prop_assume!(n != 3);
+            let args = vec![OscType::String("x".into()); n];
+            prop_assert!(matches!(
+                Say::from_args(&args),
+                Err(MessengerProtocolError::InvalidArgumentCount(_))
+            ));
+        }
+
+        /// Tests that Say::from_args(&say.to_args()) handles arbitrary args correctly.
+        #[test]
+        fn say_from_args_round_trip(say in arb_say()) {
+            let args = say.to_args();
+            let reconstructed = Say::from_args(&args).unwrap();
+            prop_assert_eq!(reconstructed, say);
+        }
+
+    }
 }

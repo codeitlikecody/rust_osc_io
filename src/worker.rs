@@ -5,7 +5,6 @@ pub use rosc::OscError;
 use rosc::decoder;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::ops::ControlFlow;
 use std::sync::mpsc::{self};
 use std::thread::{self, JoinHandle};
 
@@ -196,10 +195,19 @@ fn spawn_osc_worker(
                     break;
                 }
                 OscCommand::SendMessage(message) => {
-                    if let ControlFlow::Break(_) =
-                        send_osc_message(destination, sender_address, &events, message)
-                    {
-                        continue;
+                    match send_osc_message(destination, sender_address, message) {
+                        Ok(bytes_sent) => {
+                            events
+                                .send(OscWorkerEvent::MessageSent(bytes_sent))
+                                .unwrap_or_else(|e| eprintln!("WORKER: Failed to send event: {e}"));
+                        }
+                        Err(error) => {
+                            events
+                                .send(OscWorkerEvent::Error(error))
+                                .unwrap_or_else(|e| {
+                                    eprintln!("WORKER: Failed to send error event: {e}")
+                                });
+                        }
                     }
                 }
             },

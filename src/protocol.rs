@@ -13,6 +13,7 @@ pub enum MessengerProtocolError {
     UnknownAddress(String),
     NotImplemented(String),
     BundleNotSupported,
+    NullByteInString(String),
 }
 impl std::fmt::Display for MessengerProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -21,6 +22,10 @@ impl std::fmt::Display for MessengerProtocolError {
             Self::ArgumentTypeMismatch(s) => write!(f, "Argument type mismatch: {s}"),
             Self::UnknownAddress(s) => write!(f, "Unknown address: {s}"),
             Self::NotImplemented(s) => write!(f, "Not implemented: {s}"),
+            Self::NullByteInString(s) => write!(
+                f,
+                "Null byte in string: {s} - OSC is null terminated, so this is not allowed"
+            ),
             Self::BundleNotSupported => write!(f, "OSC bundles are not supported"),
         }
     }
@@ -63,27 +68,46 @@ impl Message {
         }
     }
     /// Converts the message into an OscPacket.
-    pub fn to_osc(&self) -> OscPacket {
-        self.into()
+    pub fn to_osc(&self) -> Result<OscPacket, MessengerProtocolError> {
+        OscPacket::try_from(self)
     }
 }
 
 /// Implement the From trait to convert a &Message into an OscPacket.
-impl From<&Message> for OscPacket {
-    fn from(message: &Message) -> Self {
+impl TryFrom<&Message> for OscPacket {
+    type Error = MessengerProtocolError;
+    fn try_from(message: &Message) -> Result<OscPacket, MessengerProtocolError> {
         let address = message.address();
         let args = message.args();
-        OscPacket::Message(OscMessage {
+        // Check for null bytes in address or string arguments, as OSC strings are null-terminated and cannot contain null bytes.
+        for arg in &args {
+            if let OscType::String(s) = arg {
+                if s.contains('\0') {
+                    return Err(MessengerProtocolError::NullByteInString(format!(
+                        "Null byte found in string argument: {}",
+                        s
+                    )));
+                }
+            }
+        }
+        if address.contains('\0') {
+            return Err(MessengerProtocolError::NullByteInString(format!(
+                "Null byte found in OSC address: {}",
+                address
+            )));
+        }
+        Ok(OscPacket::Message(OscMessage {
             addr: address.to_string(),
             args,
-        })
+        }))
     }
 }
 
 /// Implement the From trait to convert a Message into an OscPacket.
-impl From<Message> for OscPacket {
-    fn from(message: Message) -> Self {
-        Self::from(&message)
+impl TryFrom<Message> for OscPacket {
+    type Error = MessengerProtocolError;
+    fn try_from(message: Message) -> Result<OscPacket, MessengerProtocolError> {
+        Self::try_from(&message)
     }
 }
 
@@ -370,13 +394,17 @@ mod tests {
     /// # Panics
     /// Panics if the wire format does not match the expected OSC address and arguments, or if the message cannot be round-tripped through OscPacket.
     fn assert_wire_format(message: Message, addr: &str, args: &[&str]) {
-        let packet = OscPacket::from(&message);
-        assert_eq!(packet, self::packet(addr, string_args(args))); // encoding
-        assert_eq!(Message::try_from(&packet).unwrap(), message); // decoding / round trip
-        assert_eq!(
-            Message::try_from(&packet).unwrap().args(),
-            string_args(args)
-        ); // argument extraction        
+        match OscPacket::try_from(&message) {
+            Ok(packet) => {
+                assert_eq!(packet, self::packet(addr, string_args(args))); // encoding
+                assert_eq!(Message::try_from(&packet).unwrap(), message); // decoding / round trip
+                assert_eq!(
+                    Message::try_from(&packet).unwrap().args(),
+                    string_args(args)
+                ); // argument extraction        
+            }
+            Err(err) => panic!("Failed to convert message to OscPacket: {}", err),
+        };
     }
 
     /// Helper function to create a sample Say message for testing.
@@ -470,6 +498,18 @@ mod tests {
             client_name: "Alice".to_string(),
             application_name: "Protocol Test Client".to_string(),
         }
+    }
+
+    /// tests encoding of null bytes in strings, which should be rejected by the protocol.
+    //TODO: Fix this test. A zero byte seems to cause issues for rust as well as osc. I need fto handle it better.
+    #[test]
+    fn null_bytes_in_strings() {
+        let bad_string: String = "Hello, \0world!".to_string();
+        let args = string_args(&["message_uuid", "client_uuid", "Hello, \0world!"]);
+        let err = Say::from_args(&args).unwrap_err();
+        let no = "no";
+        print!("Null byte in string test: {no}");
+        assert!(matches!(err, MessengerProtocolError::NullByteInString(_)));
     }
 
     /// Test the wire format of the introduce message, including encoding and decoding.
@@ -658,11 +698,14 @@ mod tests {
         /// Tests that a Message can be converted to an OscPacket, encoded to osc and back without loss of information.
         #[test]
         fn message_round_trip(message in arb_message()) {
-            let packet = message.to_osc();
+            if let Ok(packet) = message.to_osc(){
             let encoded = rosc::encoder::encode(&packet).unwrap();
             let (_, decoded_packet) = rosc::decoder::decode_udp(&encoded).unwrap();
             let decoded_message = Message::try_from(decoded_packet).unwrap();
             prop_assert_eq!(decoded_message, message);
+            } else {
+                panic!("Failed to convert message to OscPacket: {:?}", message);
+            }
         }
 
         /// Tests that MessengerClient::from_args handles arbitrary arg counts correctly, never panics and that wrong counts are an error.

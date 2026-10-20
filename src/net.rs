@@ -1,12 +1,10 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::ops::ControlFlow;
-use std::sync::mpsc::{self};
 
 pub use rosc::{OscError, encoder};
 
 use crate::protocol::Message;
-use crate::worker::{OscWorkerError, OscWorkerEvent};
+use crate::worker::OscWorkerError;
 
 /// Binds a UDP socket on `port` and joins the multicast `group` (with loopback enabled).
 /// # Arguments
@@ -57,47 +55,41 @@ pub fn create_sender_socket(sender_address: SocketAddrV4) -> io::Result<UdpSocke
 /// * `events` - A channel sender to report events back to the main thread.
 /// * `message` - The OSC message to send.
 /// # Returns
-/// A `ControlFlow` indicating whether to continue or break the sending loop.
+/// A `Result` indicating success or an `OscWorkerError`.
 pub fn send_osc_message(
     destination_address: SocketAddrV4,
     sender_address: SocketAddrV4,
-    events: &mpsc::Sender<OscWorkerEvent>,
     message: Message,
-) -> ControlFlow<()> {
+) -> Result<usize, OscWorkerError> {
     let socket = match create_sender_socket(sender_address) {
         Ok(socket) => socket,
         Err(error) => {
             eprintln!("WORKER: Failed to create sender socket: {error}");
-            events
-                .send(OscWorkerEvent::Error(OscWorkerError::IoError(error)))
-                .unwrap_or_else(|e| eprintln!("WORKER: Failed to send error event: {e}"));
-            return ControlFlow::Break(());
+            return Err(OscWorkerError::IoError(error));
         }
     };
     // Create a sender socket to send the message
 
+    let message_osc = match message.to_osc() {
+        Ok(message) => message,
+        Err(error) => {
+            eprintln!("WORKER: Failed to convert message to OSC packet: {error}");
+            return Err(OscWorkerError::MessengerProtocolError(error));
+        }
+    };
+
     // Send the message to the multicast group and port
-    match encoder::encode(&message.to_osc()) {
+    match encoder::encode(&message_osc) {
         Ok(buf) => match socket.send_to(&buf, destination_address) {
-            Ok(bytes_sent) => {
-                events
-                    .send(OscWorkerEvent::MessageSent(bytes_sent))
-                    .unwrap_or_else(|e| eprintln!("WORKER: Failed to send event: {e}"));
-            }
+            Ok(bytes_sent) => return Ok(bytes_sent),
             Err(error) => {
                 eprintln!("WORKER: Failed to send OSC message: {error}");
-                events
-                    .send(OscWorkerEvent::Error(OscWorkerError::IoError(error)))
-                    .unwrap_or_else(|e| eprintln!("WORKER: Failed to send error event: {e}"));
+                return Err(OscWorkerError::IoError(error));
             }
         },
         Err(error) => {
             eprintln!("WORKER: Failed to encode OSC message: {error}");
-            // events
-            //     .send(OscWorkerEvent::Error(OscWorkerError::IoError(error)))
-            //     .unwrap_or_else(|e| eprintln!("WORKER: Failed to send error event: {e}"));
+            return Err(OscWorkerError::OscError(error));
         }
     }
-
-    ControlFlow::Continue(())
 }

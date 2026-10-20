@@ -335,6 +335,8 @@ impl Say {
 /// tests
 #[cfg(test)]
 mod tests {
+    use rosc::{OscBundle, OscTime};
+
     use super::*;
 
     /// Helper function to convert a slice of string slices into a vector of OscType::String.
@@ -370,6 +372,10 @@ mod tests {
         let packet = OscPacket::from(&message);
         assert_eq!(packet, self::packet(addr, string_args(args))); // encoding
         assert_eq!(Message::try_from(&packet).unwrap(), message); // decoding / round trip
+        assert_eq!(
+            Message::try_from(&packet).unwrap().args(),
+            string_args(args)
+        ); // argument extraction        
     }
 
     /// Helper function to create a sample Say message for testing.
@@ -391,6 +397,67 @@ mod tests {
             OSC_ADDRESS_ME_SAY,
             &["message_uuid", "client_uuid", "Hello, world!"],
         );
+    }
+
+    /// Tests Say::from_args and to_args methods for round-trip conversion.
+    #[test]
+    fn say_round_trip() {
+        let say = sample_say();
+        let args = say.to_args();
+        let say2 = Say::from_args(&args).unwrap();
+        assert_eq!(say, say2);
+    }
+
+    /// Tests Say::from_args for too few arguments, expecting an InvalidArgumentCount error.
+    #[test]
+    fn say_from_args_error_too_few() {
+        let args = string_args(&["message_uuid", "client_uuid"]);
+        let err = Say::from_args(&args).unwrap_err();
+        assert!(matches!(
+            err,
+            MessengerProtocolError::InvalidArgumentCount(_)
+        ));
+    }
+
+    /// Tests Say::from_args for too many arguments, expecting an InvalidArgumentCount error.
+    #[test]
+    fn say_from_args_error_too_many() {
+        let args = string_args(&["message_uuid", "client_uuid", "Hello, world!", "extra_arg"]);
+        let err = Say::from_args(&args).unwrap_err();
+        assert!(matches!(
+            err,
+            MessengerProtocolError::InvalidArgumentCount(_)
+        ));
+    }
+
+    /// Tests Say::from_args for non-string argument types, expecting an ArgumentTypeMismatch error.
+    #[test]
+    fn say_from_args_error_non_string() {
+        let args = vec![
+            OscType::Int(42),
+            OscType::Float(3.14),
+            OscType::String("Hello, world!".to_string()),
+        ];
+        let err = Say::from_args(&args).unwrap_err();
+        assert!(matches!(
+            err,
+            MessengerProtocolError::ArgumentTypeMismatch(_)
+        ));
+    }
+
+    /// Tests Say::from_args for invalid argument types, expecting an ArgumentTypeMismatch error.
+    #[test]
+    fn say_from_args_error_type() {
+        let args = vec![
+            OscType::String("message_uuid".to_string()),
+            OscType::Int(42),
+            OscType::String("Hello, world!".to_string()),
+        ];
+        let err = Say::from_args(&args).unwrap_err();
+        assert!(matches!(
+            err,
+            MessengerProtocolError::ArgumentTypeMismatch(_)
+        ));
     }
 
     /// Helper function to create a sample MessengerClient for testing.
@@ -424,14 +491,136 @@ mod tests {
         );
     }
 
-    //// Test the wire format of the who message, including encoding and decoding.
-    // #[test]
-    // fn who_wire_format() {
-    //     assert_wire_format(Message::Who(Who::Todo), OSC_ADDRESS_WHO, &[]);
-    // }
+    /// Tests MessengerClient::from_args and to_args methods for round-trip conversion.
+    #[test]
+    fn messenger_client_round_trip() {
+        let client = sample_client();
+        let args = client.to_args();
+        let client2 = MessengerClient::from_args(&args).unwrap();
+        assert_eq!(client, client2);
+    }
 
-    // const OSC_ADDRESS_ME_INTRODUCE: &str = "/messenger/me/introduce";
-    // const OSC_ADDRESS_ME_WELCOME: &str = "/messenger/me/welcome";
-    // const OSC_ADDRESS_ME_SAY: &str = "/messenger/me/say";
-    // const OSC_ADDRESS_WHO: &str = "/messenger/who";
+    /// Tests MessengerClient::from_args for too few arguments, expecting an InvalidArgumentCount error.
+    #[test]
+    fn messenger_client_from_args_error_too_few() {
+        let args = string_args(&["client_uuid", "Alice"]);
+        let err = MessengerClient::from_args(&args).unwrap_err();
+        assert!(matches!(
+            err,
+            MessengerProtocolError::InvalidArgumentCount(_)
+        ));
+    }
+
+    /// Tests MessengerClient::from_args for too many arguments, expecting an InvalidArgumentCount error.
+    #[test]
+    fn messenger_client_from_args_error_too_many() {
+        let args = string_args(&["client_uuid", "Alice", "Protocol Test Client", "extra_arg"]);
+        let err = MessengerClient::from_args(&args).unwrap_err();
+        assert!(matches!(
+            err,
+            MessengerProtocolError::InvalidArgumentCount(_)
+        ));
+    }
+
+    /// Tests MessengerClient::from_args for invalid argument types, expecting an ArgumentTypeMismatch error.
+    #[test]
+    fn messenger_client_from_args_error_type() {
+        let args = vec![
+            OscType::String("client_uuid".to_string()),
+            OscType::Int(42),
+            OscType::String("Protocol Test Client".to_string()),
+        ];
+        let err = MessengerClient::from_args(&args).unwrap_err();
+        assert!(matches!(
+            err,
+            MessengerProtocolError::ArgumentTypeMismatch(_)
+        ));
+    }
+
+    /// Tests Message::try_from with an unknown address.
+    #[test]
+    fn message_try_from_unknown_address() {
+        let packet = packet("/unknown/address", vec![]);
+        let err = Message::try_from(&packet).unwrap_err();
+        assert!(matches!(err, MessengerProtocolError::UnknownAddress(_)));
+    }
+
+    /// Tests Message::try_from with /messenger/who, which should give NotImplemented.
+    #[test]
+    fn message_try_from_who() {
+        let packet = packet("/messenger/who", vec![]);
+        let err = Message::try_from(&packet).unwrap_err();
+        assert!(matches!(err, MessengerProtocolError::NotImplemented(_)));
+    }
+
+    /// Tests Message::try_from with a bundle, which should give BundleNotSupported.
+    #[test]
+    fn message_try_from_bundle() {
+        let bundle = OscPacket::Bundle(OscBundle {
+            timetag: OscTime {
+                seconds: 1,
+                fractional: 1,
+            },
+            content: vec![],
+        });
+        let err = Message::try_from(&bundle).unwrap_err();
+        assert!(matches!(err, MessengerProtocolError::BundleNotSupported));
+    }
+
+    /// Test try_from on /messenger/me/introduce with bad args, to confirm the error is propagated.
+    #[test]
+    fn message_try_from_introduce_bad_args() {
+        let packet = packet(
+            "/messenger/me/introduce",
+            string_args(&["client_uuid", "Alice"]), // missing application name
+        );
+        let err = Message::try_from(&packet).unwrap_err();
+        assert!(matches!(
+            err,
+            MessengerProtocolError::InvalidArgumentCount(_)
+        ));
+    }
+
+    /// Test Say::new for unique message UUIDs
+    #[test]
+    fn say_new_unique_message_uuids() {
+        let say1 = Say::new("client_uuid".into(), "Hello, World!".into());
+        let say2 = Say::new("client_uuid".into(), "Hello, World!".into());
+        assert_ne!(say1.message_uuid, say2.message_uuid);
+    }
+
+    /// Test Say::new for storing inputs.
+    #[test]
+    fn say_new_storing_inputs() {
+        let say = Say::new("client_uuid".into(), "Hello, World!".into());
+        assert_eq!(say.client_uuid, "client_uuid");
+        assert_eq!(say.message, "Hello, World!");
+    }
+
+    /// Test MessengerClient::new for unique UUIDs
+    #[test]
+    fn messenger_client_new_unique_uuids() {
+        let client1 = MessengerClient::new("Alice".into(), "MyApp".into());
+        let client2 = MessengerClient::new("Bob".into(), "MyApp".into());
+        assert_ne!(client1.client_uuid, client2.client_uuid);
+    }
+
+    /// Test MessengerClient::new for storing inputs
+    #[test]
+    fn messenger_client_new_storing_inputs() {
+        let client = MessengerClient::new("Alice".into(), "MyApp".into());
+        assert_eq!(client.client_name, "Alice");
+        assert_eq!(client.application_name, "MyApp");
+    }
+
+    /// Test MessengerClient accessors (client_uuid(), client_name(), application_name()) for returning the correct values.
+    #[test]
+    fn messenger_client_accessors() {
+        let client = sample_client();
+        assert_eq!(client.client_uuid(), "client_uuid");
+        assert_eq!(client.client_name(), "Alice");
+        assert_eq!(client.application_name(), "Protocol Test Client");
+    }
+
+    // TODO: Add tests for other message types and error cases as needed.
 }

@@ -331,3 +331,107 @@ impl Say {
         "say"
     }
 }
+
+/// tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper function to convert a slice of string slices into a vector of OscType::String.
+    /// # Arguments
+    /// * `v` - A slice of string slices.
+    /// # Returns
+    /// A vector of OscType::String.
+    fn string_args(v: &[&str]) -> Vec<OscType> {
+        v.iter().map(|s| OscType::String(s.to_string())).collect()
+    }
+
+    /// Helper function to create an OscPacket from an address and a vector of OscType arguments.
+    /// # Arguments
+    /// * `addr` - The OSC address as a string slice.
+    /// * `args` - A vector of OscType arguments.
+    /// # Returns
+    /// An OscPacket containing the given address and arguments.
+    fn packet(addr: &str, args: Vec<OscType>) -> OscPacket {
+        OscPacket::Message(OscMessage {
+            addr: addr.to_string(),
+            args,
+        })
+    }
+
+    /// Assert that the wire format of a message matches the expected OSC address and arguments, and that the message can be round-tripped through OscPacket.
+    /// # Arguments
+    /// * `message` - The Message to test.
+    /// * `addr` - The expected OSC address as a string slice.
+    /// * `args` - A slice of string slices representing the expected arguments.
+    /// # Panics
+    /// Panics if the wire format does not match the expected OSC address and arguments, or if the message cannot be round-tripped through OscPacket.
+    fn assert_wire_format(message: Message, addr: &str, args: &[&str]) {
+        let packet = OscPacket::from(&message);
+        assert_eq!(packet, self::packet(addr, string_args(args))); // encoding
+        assert_eq!(Message::try_from(&packet).unwrap(), message); // decoding / round trip
+    }
+
+    /// Helper function to create a sample Say message for testing.
+    /// # Returns
+    /// A sample Say message for testing.
+    fn sample_say() -> Say {
+        Say {
+            message_uuid: "message_uuid".to_string(),
+            client_uuid: "client_uuid".to_string(),
+            message: "Hello, world!".to_string(),
+        }
+    }
+
+    /// Test the wire format of the say message, including encoding and decoding.
+    #[test]
+    fn say_wire_format() {
+        assert_wire_format(
+            Message::Me(Me::Say(sample_say())),
+            OSC_ADDRESS_ME_SAY,
+            &["message_uuid", "client_uuid", "Hello, world!"],
+        );
+    }
+
+    /// Helper function to create a sample MessengerClient for testing.
+    /// # Returns
+    /// A sample MessengerClient for testing.
+    fn sample_client() -> MessengerClient {
+        MessengerClient {
+            client_uuid: "client_uuid".to_string(),
+            client_name: "Alice".to_string(),
+            application_name: "Protocol Test Client".to_string(),
+        }
+    }
+
+    /// Test the wire format of the introduce message, including encoding and decoding.
+    #[test]
+    fn introduce_wire_format() {
+        assert_wire_format(
+            Message::Me(Me::Introduce(sample_client())),
+            OSC_ADDRESS_ME_INTRODUCE,
+            &["client_uuid", "Alice", "Protocol Test Client"],
+        );
+    }
+
+    /// Test the wire format of the welcome message, including encoding and decoding.
+    #[test]
+    fn welcome_wire_format() {
+        assert_wire_format(
+            Message::Me(Me::Welcome(sample_client())),
+            OSC_ADDRESS_ME_WELCOME,
+            &["client_uuid", "Alice", "Protocol Test Client"],
+        );
+    }
+
+    //// Test the wire format of the who message, including encoding and decoding.
+    // #[test]
+    // fn who_wire_format() {
+    //     assert_wire_format(Message::Who(Who::Todo), OSC_ADDRESS_WHO, &[]);
+    // }
+
+    // const OSC_ADDRESS_ME_INTRODUCE: &str = "/messenger/me/introduce";
+    // const OSC_ADDRESS_ME_WELCOME: &str = "/messenger/me/welcome";
+    // const OSC_ADDRESS_ME_SAY: &str = "/messenger/me/say";
+    // const OSC_ADDRESS_WHO: &str = "/messenger/who";
+}

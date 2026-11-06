@@ -383,7 +383,10 @@ fn spawn_osc_worker(
                 events
                     .send(OscWorkerEvent::Error(OscWorkerError::IoError(error)))
                     .unwrap_or_else(|e| eprintln!("WORKER: Failed to send error event: {e}"));
-                // return Err(OscWorkerError::IoError(error));
+                send_farewell(destination, sender_address, &client, &events);
+                leave_multicast_group(&socket, multicast_group, listener_address.ip())
+                    .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
+                break;
             }
         }
     }

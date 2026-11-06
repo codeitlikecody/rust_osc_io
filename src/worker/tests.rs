@@ -40,6 +40,18 @@ fn does_not_welcome_non_introduction_messages() {
 }
 
 #[test]
+fn room_say_is_delivered_only_to_clients_in_that_room() {
+    let say = Message::Me(Me::SayInRoom(RoomSay::new(
+        "lobby".to_string(),
+        Say::new("sender".to_string(), "hello".to_string()),
+    )));
+
+    assert!(should_deliver_message(&say, Some("lobby")));
+    assert!(!should_deliver_message(&say, None));
+    assert!(!should_deliver_message(&say, Some("other")));
+}
+
+#[test]
 fn replies_to_outside_room_query_when_not_in_that_room() {
     let local_client = client("local");
     let query = Message::Who(Who::Listening("lobby".to_string()));
@@ -189,6 +201,29 @@ fn received_listening_from_both(
     }
 }
 
+fn received_listening_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return false;
+        }
+
+        match handle.event_receiver().recv_timeout(timeout) {
+            Ok(OscWorkerEvent::MessageReceived(_, Message::Me(Me::Listening(client))))
+                if client.client_uuid() == expected_client_uuid =>
+            {
+                return true;
+            }
+            Ok(OscWorkerEvent::Error(error)) => {
+                eprintln!("wire test worker error: {error:?}");
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
 fn received_in_room_listening_from(
     handle: &OscWorkerHandle,
     expected_client_uuid: &str,
@@ -246,6 +281,27 @@ fn received_room_say_from(
             }
             Ok(_) => {}
             Err(_) => return false,
+        }
+    }
+}
+
+fn did_not_receive_room_say(handle: &OscWorkerHandle, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+
+        match handle.event_receiver().recv_timeout(remaining) {
+            Ok(OscWorkerEvent::MessageReceived(_, Message::Me(Me::SayInRoom(_)))) => {
+                return false;
+            }
+            Ok(OscWorkerEvent::Error(error)) => {
+                eprintln!("wire test worker error: {error:?}");
+            }
+            Ok(_) => {}
+            Err(_) => return true,
         }
     }
 }
@@ -317,19 +373,17 @@ fn two_workers_exchange_welcomes_over_multicast() {
     first
         .say_in_room("lobby".to_string(), "Hello from room".to_string())
         .unwrap();
-    let second_received_room_say =
-        received_room_say_from(&second, &first_uuid, "lobby", "Hello from room");
-    assert!(
-        wait_for_message_sent(&first),
-        "first client did not send its room message"
-    );
+    let first_sent_room_say = wait_for_message_sent(&first);
+    let first_received_room_say =
+        received_room_say_from(&first, &first_uuid, "lobby", "Hello from room");
+    let second_did_not_receive_room_say =
+        did_not_receive_room_say(&second, Duration::from_millis(500));
     first.exit_room("lobby".to_string()).unwrap();
     let first_exited_room = wait_for_message_sent(&first);
     second
         .query_listening_outside_room("lobby".to_string())
         .unwrap();
-    let outside_replies_after_exit =
-        received_listening_from_both(&first, &first_uuid, &second_uuid);
+    let first_replied_after_exit = received_listening_from(&first, &first_uuid);
 
     first.stop_osc_worker().unwrap();
     let first_sent_farewell = received_farewell_from(&second, &first_uuid);
@@ -358,13 +412,21 @@ fn two_workers_exchange_welcomes_over_multicast() {
         "in-room client did not receive its listening reply"
     );
     assert!(
-        second_received_room_say,
-        "second client did not receive first client's room message"
+        first_received_room_say,
+        "room member did not receive first client's room message"
+    );
+    assert!(
+        second_did_not_receive_room_say,
+        "client outside the room received a room-scoped message"
+    );
+    assert!(
+        first_sent_room_say,
+        "first client did not send its room message"
     );
     assert!(first_exited_room, "first client did not exit lobby");
     assert!(
-        outside_replies_after_exit,
-        "clients did not reply to outside-room query after first client exited"
+        first_replied_after_exit,
+        "first client did not reply to outside-room query after exiting"
     );
     assert!(
         first_sent_farewell,

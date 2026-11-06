@@ -284,48 +284,50 @@ fn spawn_osc_worker(
         // Receive an OSC packet from the socket
         match socket.recv_from(&mut buffer) {
             Ok((size, sender)) => match decoder::decode_udp(&buffer[..size]) {
-                Ok((_, packet)) => {
-                    match packet.try_into() {
-                        Ok(message) => {
-                            let response = response_to(&message, &client, current_room.as_deref());
+                Ok((_, packet)) => match packet.try_into() {
+                    Ok(message) => {
+                        let deliver_message =
+                            should_deliver_message(&message, current_room.as_deref());
+                        let response = response_to(&message, &client, current_room.as_deref());
+                        if deliver_message {
                             events
-                                .send(OscWorkerEvent::MessageReceived(sender, message))
-                                .unwrap_or_else(|e| {
-                                    eprintln!("Worker Error 822: Failed to send message received event: {e}")
-                                });
-                            if let Some(response) = response {
-                                match send_osc_message(destination, sender_address, response) {
-                                    Ok(bytes_sent) => {
-                                        events
-                                            .send(OscWorkerEvent::MessageSent(bytes_sent))
-                                            .unwrap_or_else(|e| {
-                                                eprintln!("WORKER: Failed to send event: {e}")
-                                            });
-                                    }
-                                    Err(error) => {
-                                        events.send(OscWorkerEvent::Error(error)).unwrap_or_else(
-                                            |e| {
-                                                eprintln!("WORKER: Failed to send error event: {e}")
-                                            },
-                                        );
-                                    }
+                                    .send(OscWorkerEvent::MessageReceived(sender, message))
+                                    .unwrap_or_else(|e| {
+                                        eprintln!("Worker Error 822: Failed to send message received event: {e}")
+                                    });
+                        }
+                        if let Some(response) = response {
+                            match send_osc_message(destination, sender_address, response) {
+                                Ok(bytes_sent) => {
+                                    events
+                                        .send(OscWorkerEvent::MessageSent(bytes_sent))
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("WORKER: Failed to send event: {e}")
+                                        });
+                                }
+                                Err(error) => {
+                                    events
+                                        .send(OscWorkerEvent::Error(error))
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("WORKER: Failed to send error event: {e}")
+                                        });
                                 }
                             }
                         }
-                        Err(error) => {
-                            eprintln!(
-                                "Worker Error 971: Failed to convert OSC packet to Message. : {error}"
-                            );
-                            events
-                                .send(OscWorkerEvent::Error(
-                                    OscWorkerError::MessengerProtocolError(error),
-                                ))
-                                .unwrap_or_else(|e| {
-                                    eprintln!("WORKER: Failed to send error event: {e}")
-                                });
-                        }
                     }
-                }
+                    Err(error) => {
+                        eprintln!(
+                            "Worker Error 971: Failed to convert OSC packet to Message. : {error}"
+                        );
+                        events
+                            .send(OscWorkerEvent::Error(
+                                OscWorkerError::MessengerProtocolError(error),
+                            ))
+                            .unwrap_or_else(|e| {
+                                eprintln!("WORKER: Failed to send error event: {e}")
+                            });
+                    }
+                },
 
                 Err(error) => {
                     eprintln!("WORKER: Failed to decode OSC packet: {error}");
@@ -393,6 +395,13 @@ fn response_to(
             ))))
         }
         _ => None,
+    }
+}
+
+fn should_deliver_message(message: &Message, current_room: Option<&str>) -> bool {
+    match message {
+        Message::Me(Me::SayInRoom(room_say)) => current_room == Some(room_say.room_name()),
+        _ => true,
     }
 }
 

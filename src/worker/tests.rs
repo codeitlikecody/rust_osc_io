@@ -119,7 +119,28 @@ fn entering_and_exiting_updates_current_room_correctly() {
         .is_some()
     );
 
+    update_current_room(&mut current_room, "other", true);
+    assert_eq!(current_room.as_deref(), Some("other"));
+    assert!(
+        response_to(
+            &Message::Who(Who::ListeningInRoom("lobby".to_string())),
+            &local_client,
+            current_room.as_deref()
+        )
+        .is_none()
+    );
+    assert!(
+        response_to(
+            &Message::Who(Who::ListeningInRoom("other".to_string())),
+            &local_client,
+            current_room.as_deref()
+        )
+        .is_some()
+    );
+
     update_current_room(&mut current_room, "lobby", false);
+    assert_eq!(current_room.as_deref(), Some("other"));
+    update_current_room(&mut current_room, "other", false);
     assert_eq!(current_room, None);
     assert!(
         response_to(

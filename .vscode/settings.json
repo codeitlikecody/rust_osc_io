@@ -3,6 +3,9 @@
         "cargo fmt": true,
         "cargo test": true,
         "rustfmt": true,
-        "cargo clippy": true
+        "cargo clippy": true,
+        "cargo search": true,
+        "cargo info": true,
+        "cargo check": true
     }
 }

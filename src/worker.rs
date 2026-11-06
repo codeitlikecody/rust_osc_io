@@ -162,6 +162,10 @@ impl OscWorkerHandle {
         self.client.client_uuid()
     }
 
+    pub fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
     /// Sends a command to the worker thread to stop it.
     /// Returns `WouldBlock` if the command queue is full.
     pub fn stop_osc_worker(&self) -> Result<(), io::Error> {

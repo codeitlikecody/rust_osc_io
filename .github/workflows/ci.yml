@@ -24,3 +24,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --lib worker::tests::two_workers_exchange_welcomes_over_multicast -- --ignored --exact
+      - run: cargo test --lib gateway::tests::gateway_server_accepts_patron_and_notifies_shutdown -- --ignored --exact

@@ -5,7 +5,7 @@ use rosc::{OscBundle, OscMessage, OscPacket, OscType, decoder, encoder};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -15,8 +15,10 @@ pub const GATEWAY_PORT: u16 = 9030;
 const MAX_TCP_PACKET_BYTES: usize = 65_507;
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const MAX_PENDING_CONNECTIONS: usize = 32;
+const MAX_ACCEPTS_PER_TICK: usize = 32;
 const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const PATRON_READ_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MULTICAST_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const PATRON_TIMEOUT: Duration = Duration::from_secs(30);
@@ -64,13 +66,14 @@ impl Default for GatewayConfig {
 struct Patron {
     uuid: String,
     outbound: SyncSender<Vec<u8>>,
-    write_stream: Arc<Mutex<TcpStream>>,
+    writer_finished: Receiver<()>,
     control_stream: TcpStream,
     last_pong: Instant,
 }
 
 struct LoopbackPacket {
     received_at: Instant,
+    source_port: u16,
     bytes: Vec<u8>,
 }
 
@@ -79,6 +82,8 @@ struct GatewayShared {
     max_patrons: usize,
     multicast_destination: SocketAddrV4,
     multicast_sender: UdpSocket,
+    multicast_sender_port: u16,
+    shutting_down: AtomicBool,
     patrons: Mutex<HashMap<u64, Patron>>,
     next_patron_id: AtomicU64,
     pending_connections: AtomicUsize,
@@ -109,6 +114,7 @@ pub fn run_gateway(config: GatewayConfig, shutdown: Receiver<()>) -> io::Result<
         create_receiver_socket(config.multicast_group, config.multicast_listener_address)?;
     multicast_receiver.set_read_timeout(Some(MULTICAST_POLL_INTERVAL))?;
     let multicast_sender = create_sender_socket(config.multicast_sender_address)?;
+    let multicast_sender_port = multicast_sender.local_addr()?.port();
     let multicast_destination = SocketAddrV4::new(
         config.multicast_group,
         config.multicast_listener_address.port(),
@@ -118,6 +124,8 @@ pub fn run_gateway(config: GatewayConfig, shutdown: Receiver<()>) -> io::Result<
         max_patrons: config.max_patrons,
         multicast_destination,
         multicast_sender,
+        multicast_sender_port,
+        shutting_down: AtomicBool::new(false),
         patrons: Mutex::new(HashMap::new()),
         next_patron_id: AtomicU64::new(1),
         pending_connections: AtomicUsize::new(0),
@@ -138,9 +146,14 @@ pub fn run_gateway(config: GatewayConfig, shutdown: Receiver<()>) -> io::Result<
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
+        let mut accepted_this_tick = 0;
         loop {
+            if accepted_this_tick >= MAX_ACCEPTS_PER_TICK {
+                break;
+            }
             match listener.accept() {
                 Ok((stream, address)) => {
+                    accepted_this_tick += 1;
                     let pending = shared.pending_connections.fetch_add(1, Ordering::Relaxed);
                     if pending >= MAX_PENDING_CONNECTIONS {
                         shared.pending_connections.fetch_sub(1, Ordering::Relaxed);
@@ -151,8 +164,8 @@ pub fn run_gateway(config: GatewayConfig, shutdown: Receiver<()>) -> io::Result<
                     }
                     let connection_shared = Arc::clone(&shared);
                     match thread::Builder::new().spawn(move || {
-                        let _pending = PendingConnection(Arc::clone(&connection_shared));
-                        handle_patron_connection(stream, connection_shared);
+                        let pending = PendingConnection(Arc::clone(&connection_shared));
+                        handle_patron_connection(stream, connection_shared, pending);
                     }) {
                         Ok(thread) => connection_threads.push(thread),
                         Err(error) => {
@@ -169,18 +182,7 @@ pub fn run_gateway(config: GatewayConfig, shutdown: Receiver<()>) -> io::Result<
 
         match multicast_receiver.recv_from(&mut buffer) {
             Ok((size, sender)) => {
-                let bytes = &buffer[..size];
-                if !consume_loopback_packet(&shared, bytes) {
-                    match decoder::decode_udp(bytes) {
-                        Ok((_, packet)) if !contains_gateway_message(&packet) => {
-                            broadcast_packet(&shared, &packet, None);
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            eprintln!("Ignoring invalid multicast packet from {sender}: {error}")
-                        }
-                    }
-                }
+                forward_multicast_datagram(&shared, sender, &buffer[..size]);
             }
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
@@ -198,11 +200,8 @@ pub fn run_gateway(config: GatewayConfig, shutdown: Receiver<()>) -> io::Result<
         reap_connection_threads(&mut connection_threads);
     };
 
+    shared.shutting_down.store(true, Ordering::Release);
     send_gateway_shutdown(&shared);
-    let patron_ids: Vec<_> = lock(&shared.patrons).keys().copied().collect();
-    for patron_id in patron_ids {
-        remove_patron(&shared, patron_id);
-    }
     for thread in connection_threads {
         if thread.join().is_err() {
             eprintln!("Patron connection thread panicked during shutdown");
@@ -216,9 +215,14 @@ pub fn run_gateway(config: GatewayConfig, shutdown: Receiver<()>) -> io::Result<
     run_result
 }
 
-fn handle_patron_connection(mut stream: TcpStream, shared: Arc<GatewayShared>) {
+fn handle_patron_connection(
+    mut stream: TcpStream,
+    shared: Arc<GatewayShared>,
+    pending: PendingConnection,
+) {
     if let Err(error) = stream
-        .set_read_timeout(Some(TCP_HANDSHAKE_TIMEOUT))
+        .set_nonblocking(false)
+        .and_then(|_| stream.set_read_timeout(Some(TCP_HANDSHAKE_TIMEOUT)))
         .and_then(|_| stream.set_write_timeout(Some(TCP_WRITE_TIMEOUT)))
     {
         eprintln!("Failed to configure patron connection: {error}");
@@ -243,6 +247,7 @@ fn handle_patron_connection(mut stream: TcpStream, shared: Arc<GatewayShared>) {
 
     let patron_id = shared.next_patron_id.fetch_add(1, Ordering::Relaxed);
     let (outbound, outbound_rx) = mpsc::sync_channel(OUTBOUND_QUEUE_CAPACITY);
+    let (writer_finished_tx, writer_finished) = mpsc::channel();
     let writer_stream = match stream.try_clone() {
         Ok(stream) => Arc::new(Mutex::new(stream)),
         Err(error) => {
@@ -269,6 +274,16 @@ fn handle_patron_connection(mut stream: TcpStream, shared: Arc<GatewayShared>) {
         return;
     }
 
+    let accept = string_message(ACCEPT, &[&shared.gateway_uuid, &patron_uuid]);
+    let accept_frame = match encoder::encode_tcp(&accept) {
+        Ok(frame) => frame,
+        Err(error) => {
+            drop(patrons);
+            eprintln!("Failed to encode gateway acceptance: {error}");
+            return;
+        }
+    };
+
     let writer_shared = Arc::clone(&shared);
     let writer_stream_for_thread = Arc::clone(&writer_stream);
     let writer = match thread::Builder::new().spawn(move || {
@@ -277,6 +292,7 @@ fn handle_patron_connection(mut stream: TcpStream, shared: Arc<GatewayShared>) {
             writer_stream_for_thread,
             outbound_rx,
             writer_shared,
+            writer_finished_tx,
         );
     }) {
         Ok(writer) => writer,
@@ -291,44 +307,50 @@ fn handle_patron_connection(mut stream: TcpStream, shared: Arc<GatewayShared>) {
         }
     };
 
-    let accept = string_message(ACCEPT, &[&shared.gateway_uuid, &patron_uuid]);
-    if let Err(error) = write_tcp_packet(&mut stream, &accept) {
-        drop(outbound);
-        drop(patrons);
-        let _ = control_stream.shutdown(std::net::Shutdown::Both);
-        let _ = writer.join();
-        eprintln!("Failed to send gateway acceptance: {error}");
-        return;
-    }
-
+    let accept_sender = outbound.clone();
     patrons.insert(
         patron_id,
         Patron {
             uuid: patron_uuid.clone(),
             outbound,
-            write_stream: writer_stream,
+            writer_finished,
             control_stream,
             last_pong: Instant::now(),
         },
     );
+    if let Err(error) = accept_sender.try_send(accept_frame) {
+        drop(accept_sender);
+        drop(patrons);
+        remove_patron(&shared, patron_id);
+        let _ = writer.join();
+        eprintln!("Failed to queue gateway acceptance: {error}");
+        return;
+    }
+    drop(accept_sender);
     drop(patrons);
+    drop(pending);
     eprintln!("Accepted patron {patron_uuid}");
 
-    if let Err(error) = stream.set_read_timeout(None) {
+    if let Err(error) = stream.set_read_timeout(Some(PATRON_READ_POLL_INTERVAL)) {
         eprintln!("Failed to configure patron stream: {error}");
         remove_patron(&shared, patron_id);
         let _ = writer.join();
         return;
     }
 
+    let mut packet_reader = TcpPacketReader::default();
     loop {
-        match read_tcp_packet(&mut stream) {
-            Ok(Some(packet)) => {
+        if shared.shutting_down.load(Ordering::Acquire) {
+            break;
+        }
+        match packet_reader.read_next(&mut stream) {
+            Ok(TcpRead::Packet(packet)) => {
                 if !handle_patron_packet(&shared, patron_id, &patron_uuid, &packet) {
                     break;
                 }
             }
-            Ok(None) => break,
+            Ok(TcpRead::Idle) => {}
+            Ok(TcpRead::Closed) => break,
             Err(error) => {
                 eprintln!("Patron {patron_uuid} disconnected: {error}");
                 break;
@@ -347,6 +369,7 @@ fn patron_writer(
     stream: Arc<Mutex<TcpStream>>,
     receiver: Receiver<Vec<u8>>,
     shared: Arc<GatewayShared>,
+    finished: mpsc::Sender<()>,
 ) {
     while let Ok(frame) = receiver.recv() {
         let result = lock(&stream).write_all(&frame);
@@ -356,6 +379,7 @@ fn patron_writer(
             break;
         }
     }
+    let _ = finished.send(());
 }
 
 fn handle_patron_packet(
@@ -364,38 +388,67 @@ fn handle_patron_packet(
     patron_uuid: &str,
     packet: &OscPacket,
 ) -> bool {
-    let Some(message) = packet_message(packet) else {
-        eprintln!("Ignoring OSC bundle from patron {patron_uuid}");
-        return true;
-    };
+    if !handle_patron_controls(shared, patron_id, patron_uuid, packet) {
+        return false;
+    }
+    if let Some(packet) = filter_gateway_messages(packet) {
+        forward_patron_packet(shared, patron_id, &packet);
+    }
+    true
+}
 
-    match message.addr.as_str() {
-        ME_PATRON => {
-            if string_argument(&message.args).as_deref() == Some(patron_uuid)
-                && let Some(patron) = lock(&shared.patrons).get_mut(&patron_id)
-            {
-                patron.last_pong = Instant::now();
-            }
-            true
-        }
-        ME_LEAVE => string_argument(&message.args).as_deref() != Some(patron_uuid),
-        address if address.starts_with(GATEWAY_PREFIX) => true,
-        _ => {
-            match encoder::encode(packet) {
-                Ok(bytes) => {
-                    match shared
-                        .multicast_sender
-                        .send_to(&bytes, shared.multicast_destination)
-                    {
-                        Ok(_) => remember_loopback_packet(shared, bytes),
-                        Err(error) => eprintln!("Failed to multicast patron message: {error}"),
-                    }
+fn handle_patron_controls(
+    shared: &Arc<GatewayShared>,
+    patron_id: u64,
+    patron_uuid: &str,
+    packet: &OscPacket,
+) -> bool {
+    match packet {
+        OscPacket::Message(message) => match message.addr.as_str() {
+            ME_PATRON => {
+                if string_argument(&message.args).as_deref() == Some(patron_uuid)
+                    && let Some(patron) = lock(&shared.patrons).get_mut(&patron_id)
+                {
+                    patron.last_pong = Instant::now();
                 }
-                Err(error) => eprintln!("Failed to encode patron packet for multicast: {error}"),
+                true
             }
-            broadcast_packet(shared, packet, Some(patron_id));
-            true
+            ME_LEAVE => string_argument(&message.args).as_deref() != Some(patron_uuid),
+            address if address.starts_with(GATEWAY_PREFIX) => true,
+            _ => true,
+        },
+        OscPacket::Bundle(bundle) => bundle
+            .content
+            .iter()
+            .all(|packet| handle_patron_controls(shared, patron_id, patron_uuid, packet)),
+    }
+}
+
+fn forward_patron_packet(shared: &Arc<GatewayShared>, patron_id: u64, packet: &OscPacket) {
+    match encoder::encode(packet) {
+        Ok(bytes) => match shared
+            .multicast_sender
+            .send_to(&bytes, shared.multicast_destination)
+        {
+            Ok(_) => remember_loopback_packet(shared, shared.multicast_sender_port, bytes),
+            Err(error) => eprintln!("Failed to multicast patron message: {error}"),
+        },
+        Err(error) => eprintln!("Failed to encode patron packet for multicast: {error}"),
+    }
+    broadcast_packet(shared, packet, Some(patron_id));
+}
+
+fn forward_multicast_datagram(shared: &Arc<GatewayShared>, sender: SocketAddr, bytes: &[u8]) {
+    if consume_loopback_packet(shared, sender.port(), bytes) {
+        return;
+    }
+    match decoder::decode_udp(bytes) {
+        Ok((_, packet)) => {
+            if let Some(packet) = filter_gateway_messages(&packet) {
+                broadcast_packet(shared, &packet, None);
+            }
         }
+        Err(error) => eprintln!("Ignoring invalid multicast packet from {sender}: {error}"),
     }
 }
 
@@ -445,13 +498,22 @@ fn send_gateway_shutdown(shared: &Arc<GatewayShared>) {
             return;
         }
     };
-    let streams: Vec<_> = lock(&shared.patrons)
-        .values()
-        .map(|patron| Arc::clone(&patron.write_stream))
-        .collect();
-    for stream in streams {
-        if let Err(error) = lock(&stream).write_all(&frame) {
-            eprintln!("Failed to notify patron of gateway shutdown: {error}");
+    let patrons = std::mem::take(&mut *lock(&shared.patrons));
+    let mut writers = Vec::with_capacity(patrons.len());
+    for (patron_id, patron) in patrons {
+        if let Err(error) = patron.outbound.send(frame.clone()) {
+            eprintln!("Failed to queue gateway shutdown for patron {patron_id}: {error}");
+        }
+        drop(patron.outbound);
+        writers.push((patron_id, patron.writer_finished, patron.control_stream));
+    }
+
+    let deadline = Instant::now() + TCP_WRITE_TIMEOUT + Duration::from_secs(1);
+    for (patron_id, writer_finished, control_stream) in writers {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if writer_finished.recv_timeout(remaining).is_err() {
+            eprintln!("Timed out draining gateway shutdown for patron {patron_id}");
+            let _ = control_stream.shutdown(std::net::Shutdown::Both);
         }
     }
 }
@@ -462,7 +524,7 @@ fn remove_patron(shared: &Arc<GatewayShared>, patron_id: u64) {
     }
 }
 
-fn remember_loopback_packet(shared: &Arc<GatewayShared>, bytes: Vec<u8>) {
+fn remember_loopback_packet(shared: &Arc<GatewayShared>, source_port: u16, bytes: Vec<u8>) {
     let mut cache = lock(&shared.loopback_packets);
     let now = Instant::now();
     cache.retain(|entry| now.duration_since(entry.received_at) < LOOPBACK_CACHE_WINDOW);
@@ -471,15 +533,19 @@ fn remember_loopback_packet(shared: &Arc<GatewayShared>, bytes: Vec<u8>) {
     }
     cache.push_back(LoopbackPacket {
         received_at: now,
+        source_port,
         bytes,
     });
 }
 
-fn consume_loopback_packet(shared: &Arc<GatewayShared>, bytes: &[u8]) -> bool {
+fn consume_loopback_packet(shared: &Arc<GatewayShared>, source_port: u16, bytes: &[u8]) -> bool {
     let mut cache = lock(&shared.loopback_packets);
     let now = Instant::now();
     cache.retain(|entry| now.duration_since(entry.received_at) < LOOPBACK_CACHE_WINDOW);
-    if let Some(index) = cache.iter().position(|entry| entry.bytes == bytes) {
+    if let Some(index) = cache
+        .iter()
+        .position(|entry| entry.source_port == source_port && entry.bytes == bytes)
+    {
         cache.remove(index);
         true
     } else {
@@ -522,6 +588,68 @@ fn read_tcp_packet<R: Read>(reader: &mut R) -> io::Result<Option<OscPacket>> {
         ));
     }
     Ok(Some(packet))
+}
+
+enum TcpRead {
+    Packet(OscPacket),
+    Idle,
+    Closed,
+}
+
+#[derive(Default)]
+struct TcpPacketReader {
+    buffer: Vec<u8>,
+}
+
+impl TcpPacketReader {
+    fn read_next(&mut self, stream: &mut TcpStream) -> io::Result<TcpRead> {
+        loop {
+            if self.buffer.len() >= 4 {
+                let packet_length =
+                    u32::from_be_bytes(self.buffer[..4].try_into().unwrap()) as usize;
+                if packet_length == 0 || packet_length > MAX_TCP_PACKET_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid OSC/TCP packet length: {packet_length}"),
+                    ));
+                }
+                let frame_length = 4 + packet_length;
+                if self.buffer.len() >= frame_length {
+                    let payload = &self.buffer[4..frame_length];
+                    let (remaining, packet) = decoder::decode_udp(payload)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    if !remaining.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "OSC/TCP frame contains trailing bytes",
+                        ));
+                    }
+                    self.buffer.drain(..frame_length);
+                    return Ok(TcpRead::Packet(packet));
+                }
+            }
+
+            let mut chunk = [0u8; 8192];
+            match stream.read(&mut chunk) {
+                Ok(0) if self.buffer.is_empty() => return Ok(TcpRead::Closed),
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Patron closed during an OSC/TCP frame",
+                    ));
+                }
+                Ok(bytes_read) => self.buffer.extend_from_slice(&chunk[..bytes_read]),
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.kind() == io::ErrorKind::TimedOut =>
+                {
+                    return Ok(TcpRead::Idle);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 fn write_tcp_packet<W: Write>(writer: &mut W, packet: &OscPacket) -> io::Result<()> {
@@ -568,11 +696,25 @@ fn string_message(address: &str, values: &[&str]) -> OscPacket {
     })
 }
 
-fn contains_gateway_message(packet: &OscPacket) -> bool {
+fn filter_gateway_messages(packet: &OscPacket) -> Option<OscPacket> {
     match packet {
-        OscPacket::Message(message) => message.addr.starts_with(GATEWAY_PREFIX),
-        OscPacket::Bundle(OscBundle { content, .. }) => {
-            content.iter().any(contains_gateway_message)
+        OscPacket::Message(message) => {
+            (!message.addr.starts_with(GATEWAY_PREFIX)).then(|| packet.clone())
+        }
+        OscPacket::Bundle(bundle) => {
+            let content: Vec<_> = bundle
+                .content
+                .iter()
+                .filter_map(filter_gateway_messages)
+                .collect();
+            if content.is_empty() {
+                None
+            } else {
+                Some(OscPacket::Bundle(OscBundle {
+                    timetag: bundle.timetag.clone(),
+                    content,
+                }))
+            }
         }
     }
 }
@@ -603,11 +745,15 @@ mod tests {
     use std::io::Cursor;
 
     fn test_shared(max_patrons: usize, multicast_destination: SocketAddrV4) -> Arc<GatewayShared> {
+        let multicast_sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let multicast_sender_port = multicast_sender.local_addr().unwrap().port();
         Arc::new(GatewayShared {
             gateway_uuid: "B0BAE0A0-3BBE-4004-888B-F61CA125D0B0".to_string(),
             max_patrons,
             multicast_destination,
-            multicast_sender: UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            multicast_sender,
+            multicast_sender_port,
+            shutting_down: AtomicBool::new(false),
             patrons: Mutex::new(HashMap::new()),
             next_patron_id: AtomicU64::new(1),
             pending_connections: AtomicUsize::new(0),
@@ -621,9 +767,12 @@ mod tests {
     ) -> (TcpStream, JoinHandle<()>, OscPacket) {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
+        shared.pending_connections.fetch_add(1, Ordering::Relaxed);
+        let connection_shared = Arc::clone(&shared);
         let handler = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle_patron_connection(stream, shared);
+            let pending = PendingConnection(Arc::clone(&connection_shared));
+            handle_patron_connection(stream, connection_shared, pending);
         });
         let mut patron = TcpStream::connect(address).unwrap();
         patron
@@ -652,7 +801,31 @@ mod tests {
     }
 
     #[test]
-    fn gateway_control_bundles_are_filtered_from_forwarding() {
+    fn gateway_controls_are_filtered_from_bundles() {
+        let packet = OscPacket::Bundle(OscBundle {
+            timetag: rosc::OscTime {
+                seconds: 1,
+                fractional: 1,
+            },
+            content: vec![
+                string_message(WHO_ACTIVE, &["gateway-id"]),
+                string_message("/messenger/me/say", &["message-id", "client-id", "hello"]),
+            ],
+        });
+
+        let filtered = filter_gateway_messages(&packet).unwrap();
+        let OscPacket::Bundle(filtered) = filtered else {
+            panic!("expected filtered OSC bundle");
+        };
+        assert_eq!(filtered.content.len(), 1);
+        assert!(matches!(
+            &filtered.content[0],
+            OscPacket::Message(OscMessage { addr, .. }) if addr == "/messenger/me/say"
+        ));
+    }
+
+    #[test]
+    fn gateway_control_only_bundle_is_removed() {
         let packet = OscPacket::Bundle(OscBundle {
             timetag: rosc::OscTime {
                 seconds: 1,
@@ -660,7 +833,23 @@ mod tests {
             },
             content: vec![string_message(WHO_ACTIVE, &["gateway-id"])],
         });
-        assert!(contains_gateway_message(&packet));
+
+        assert!(filter_gateway_messages(&packet).is_none());
+    }
+
+    #[test]
+    fn loopback_suppression_matches_source_port_and_packet() {
+        let shared = test_shared(1, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3090));
+        let packet = encoder::encode(&string_message("/messenger/me/say", &["same"])).unwrap();
+        let source_port = shared.multicast_sender_port;
+        remember_loopback_packet(&shared, source_port, packet.clone());
+
+        assert!(!consume_loopback_packet(
+            &shared,
+            source_port.wrapping_add(1),
+            &packet
+        ));
+        assert!(consume_loopback_packet(&shared, source_port, &packet));
     }
 
     #[test]
@@ -668,22 +857,25 @@ mod tests {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
         let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (stream, _) = listener.accept().unwrap();
-        let write_stream = Arc::new(Mutex::new(stream.try_clone().unwrap()));
         let control_stream = stream.try_clone().unwrap();
         let (outbound, outbound_rx) = mpsc::sync_channel(1);
+        let (_writer_finished_tx, writer_finished) = mpsc::channel();
         let multicast_sender =
             UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let multicast_sender_port = multicast_sender.local_addr().unwrap().port();
         let shared = Arc::new(GatewayShared {
             gateway_uuid: "gateway-id".to_string(),
             max_patrons: 1,
             multicast_destination: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3090),
             multicast_sender,
+            multicast_sender_port,
+            shutting_down: AtomicBool::new(false),
             patrons: Mutex::new(HashMap::from([(
                 1,
                 Patron {
                     uuid: "patron-id".to_string(),
                     outbound,
-                    write_stream,
+                    writer_finished,
                     control_stream,
                     last_pong: Instant::now(),
                 },
@@ -699,6 +891,45 @@ mod tests {
         let tcp_frame = outbound_rx.try_recv().unwrap();
         let (_, decoded) = decoder::decode_tcp(&tcp_frame).unwrap();
         assert_eq!(decoded, Some(active));
+        drop(peer);
+    }
+
+    #[test]
+    fn multicast_packets_forward_to_patrons_but_gateway_controls_do_not() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let control_stream = stream.try_clone().unwrap();
+        let (outbound, outbound_rx) = mpsc::sync_channel(2);
+        let (_writer_finished_tx, writer_finished) = mpsc::channel();
+        let shared = test_shared(1, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3090));
+        lock(&shared.patrons).insert(
+            1,
+            Patron {
+                uuid: "patron-id".to_string(),
+                outbound,
+                writer_finished,
+                control_stream,
+                last_pong: Instant::now(),
+            },
+        );
+        let sender = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000));
+        let chat = string_message("/messenger/me/say", &["message-id", "client-id", "hello"]);
+        let chat_bytes = encoder::encode(&chat).unwrap();
+
+        forward_multicast_datagram(&shared, sender, &chat_bytes);
+
+        let tcp_frame = outbound_rx.try_recv().unwrap();
+        let (_, forwarded_chat) = decoder::decode_tcp(&tcp_frame).unwrap();
+        assert_eq!(forwarded_chat, Some(chat));
+
+        let gateway_control = string_message(WHO_ACTIVE, &["gateway-id"]);
+        let control_bytes = encoder::encode(&gateway_control).unwrap();
+        forward_multicast_datagram(&shared, sender, &control_bytes);
+        assert!(matches!(
+            outbound_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         drop(peer);
     }
 
@@ -724,6 +955,8 @@ mod tests {
                 &["B0BAE0A0-3BBE-4004-888B-F61CA125D0B0", "first-patron"]
             )
         );
+        assert_eq!(shared.pending_connections.load(Ordering::Relaxed), 0);
+        assert_eq!(lock(&shared.patrons).len(), 1);
 
         let (mut second, second_handler, second_response) =
             connect_patron(Arc::clone(&shared), "second-patron");
@@ -731,6 +964,8 @@ mod tests {
             second_response,
             OscPacket::Message(OscMessage { addr, .. }) if addr == ACCEPT
         ));
+        assert_eq!(shared.pending_connections.load(Ordering::Relaxed), 0);
+        assert_eq!(lock(&shared.patrons).len(), 2);
 
         let (_third, third_handler, third_response) =
             connect_patron(Arc::clone(&shared), "third-patron");
@@ -742,6 +977,8 @@ mod tests {
             )
         );
         third_handler.join().unwrap();
+        assert_eq!(shared.pending_connections.load(Ordering::Relaxed), 0);
+        assert_eq!(lock(&shared.patrons).len(), 2);
 
         let patron_say = OscPacket::Message(OscMessage {
             addr: "/messenger/me/say".to_string(),
@@ -763,5 +1000,66 @@ mod tests {
         first_handler.join().unwrap();
         write_tcp_packet(&mut second, &string_message(ME_LEAVE, &["second-patron"])).unwrap();
         second_handler.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires local multicast membership support"]
+    fn gateway_server_accepts_patron_and_notifies_shutdown() {
+        let tcp_probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen_address = tcp_probe.local_addr().unwrap();
+        drop(tcp_probe);
+
+        let udp_probe = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let multicast_listener_address = SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            udp_probe.local_addr().unwrap().port(),
+        );
+        drop(udp_probe);
+
+        let config = GatewayConfig {
+            gateway_uuid: "B0BAE0A0-3BBE-4004-888B-F61CA125D0B0".to_string(),
+            listen_address,
+            multicast_group: config::DEFAULT_MULTICAST_GROUP,
+            multicast_listener_address,
+            multicast_sender_address: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+            max_patrons: 1,
+        };
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let gateway = thread::spawn(move || run_gateway(config, shutdown_rx));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut patron = loop {
+            match TcpStream::connect_timeout(&listen_address, Duration::from_millis(100)) {
+                Ok(stream) => break stream,
+                Err(error) if Instant::now() < deadline => {
+                    if gateway.is_finished() {
+                        panic!("gateway exited before accepting patrons: {error}");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("gateway did not begin listening: {error}"),
+            }
+        };
+        patron
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let patron_uuid = "C0BAE0A0-3BBE-4004-888B-F61CA125D0B0";
+        write_tcp_packet(&mut patron, &string_message(REQUEST, &[patron_uuid])).unwrap();
+        assert_eq!(
+            read_tcp_packet(&mut patron).unwrap(),
+            Some(string_message(
+                ACCEPT,
+                &["B0BAE0A0-3BBE-4004-888B-F61CA125D0B0", patron_uuid]
+            ))
+        );
+
+        shutdown_tx.send(()).unwrap();
+        assert_eq!(
+            read_tcp_packet(&mut patron).unwrap(),
+            Some(string_message(
+                ME_SHUTDOWN,
+                &["B0BAE0A0-3BBE-4004-888B-F61CA125D0B0"]
+            ))
+        );
+        gateway.join().unwrap().unwrap();
     }
 }

@@ -563,8 +563,13 @@ impl Say {
     /// # Returns
     /// A new Say message with a random UUID, the given client UUID, and the given message text.
     pub fn new(client_uuid: String, message: String) -> Self {
+        Self::new_with_uuid(uuid::Uuid::new_v4().to_string(), client_uuid, message)
+    }
+
+    /// Creates a Say message with a caller-provided UUID.
+    pub fn new_with_uuid(message_uuid: String, client_uuid: String, message: String) -> Self {
         Self {
-            message_uuid: uuid::Uuid::new_v4().to_string(),
+            message_uuid,
             client_uuid,
             message,
         }

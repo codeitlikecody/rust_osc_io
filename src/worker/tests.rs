@@ -270,6 +270,7 @@ fn received_in_room_listening_from(
 fn received_room_say_from(
     handle: &OscWorkerHandle,
     expected_client_uuid: &str,
+    expected_message_uuid: &str,
     room_name: &str,
     expected_text: &str,
 ) -> bool {
@@ -285,6 +286,7 @@ fn received_room_say_from(
                 let args = room_say.say().to_args();
                 if room_say.room_name() == room_name
                     && args.len() == 3
+                    && args[0] == OscType::String(expected_message_uuid.to_string())
                     && args[1] == OscType::String(expected_client_uuid.to_string())
                     && args[2] == OscType::String(expected_text.to_string())
                 {
@@ -386,11 +388,20 @@ fn two_workers_exchange_welcomes_over_multicast() {
     let first_received_in_room_listening =
         received_in_room_listening_from(&first, &first_uuid, "lobby");
     first
-        .say_in_room("lobby".to_string(), "Hello from room".to_string())
+        .say_in_room_with_uuid(
+            "lobby".to_string(),
+            "room-message-id".to_string(),
+            "Hello from room".to_string(),
+        )
         .unwrap();
     let first_sent_room_say = wait_for_message_sent(&first);
-    let first_received_room_say =
-        received_room_say_from(&first, &first_uuid, "lobby", "Hello from room");
+    let first_received_room_say = received_room_say_from(
+        &first,
+        &first_uuid,
+        "room-message-id",
+        "lobby",
+        "Hello from room",
+    );
     let second_did_not_receive_room_say =
         did_not_receive_room_say(&second, Duration::from_millis(500));
     first.exit_room("lobby".to_string()).unwrap();

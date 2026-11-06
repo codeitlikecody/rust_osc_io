@@ -482,6 +482,20 @@ fn say_new_storing_inputs() {
     assert_eq!(say.message, "Hello, World!");
 }
 
+#[test]
+fn say_new_with_uuid_preserves_message_uuid() {
+    let say = Say::new_with_uuid(
+        "saved-message-id".to_string(),
+        "client_uuid".to_string(),
+        "Hello, World!".to_string(),
+    );
+
+    assert_eq!(
+        say.to_args(),
+        string_args(&["saved-message-id", "client_uuid", "Hello, World!"])
+    );
+}
+
 /// Test MessengerClient::new for unique UUIDs
 #[test]
 fn messenger_client_new_unique_uuids() {

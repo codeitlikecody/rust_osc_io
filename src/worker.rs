@@ -136,10 +136,30 @@ impl OscWorkerHandle {
         ))))
     }
 
+    pub fn say_with_uuid(&self, message_uuid: String, message: String) -> Result<(), io::Error> {
+        self.send_osc(Message::Me(Me::Say(Say::new_with_uuid(
+            message_uuid,
+            self.client.client_uuid().to_string(),
+            message,
+        ))))
+    }
+
     pub fn say_in_room(&self, room_name: String, message: String) -> Result<(), io::Error> {
         self.send_osc(Message::Me(Me::SayInRoom(RoomSay::new(
             room_name,
             Say::new(self.client.client_uuid().to_string(), message),
+        ))))
+    }
+
+    pub fn say_in_room_with_uuid(
+        &self,
+        room_name: String,
+        message_uuid: String,
+        message: String,
+    ) -> Result<(), io::Error> {
+        self.send_osc(Message::Me(Me::SayInRoom(RoomSay::new(
+            room_name,
+            Say::new_with_uuid(message_uuid, self.client.client_uuid().to_string(), message),
         ))))
     }
 

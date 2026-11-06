@@ -8,7 +8,18 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-const APPLICATION_NAME: &str = "OSCMessenger";
+fn application_name() -> String {
+    let platform = match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        platform => platform,
+    };
+    format!(
+        "OSCMessenger Desktop v{} ({platform})",
+        env!("CARGO_PKG_VERSION")
+    )
+}
 
 #[derive(Default)]
 struct Session {
@@ -60,7 +71,7 @@ fn connect(
 
     let mut config = Config::default()
         .set_name(client_name)
-        .set_application_name(APPLICATION_NAME.to_string());
+        .set_application_name(application_name());
     if let Some(client_uuid) = client_uuid.filter(|value| !value.trim().is_empty()) {
         config = config.set_client_uuid(client_uuid);
     }

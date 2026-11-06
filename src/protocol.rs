@@ -13,6 +13,7 @@ const OSC_ADDRESS_ME_LISTENING_ROOM_PREFIX: &str = "/messenger/me/listening/room
 const OSC_ADDRESS_ME_ROOM_PREFIX: &str = "/messenger/me/room/";
 const OSC_ADDRESS_ME_ROOM_ENTER_SUFFIX: &str = "/enter";
 const OSC_ADDRESS_ME_ROOM_EXIT_SUFFIX: &str = "/exit";
+const OSC_ADDRESS_ME_ROOM_SAY_SUFFIX: &str = "/say";
 
 /// Protocol error type for the messenger application. This enum represents the different types of errors that can occur when parsing or constructing messages in the messenger protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,10 @@ impl Message {
                 Me::Introduce(_) => Cow::Borrowed(OSC_ADDRESS_ME_INTRODUCE),
                 Me::Welcome(_) => Cow::Borrowed(OSC_ADDRESS_ME_WELCOME),
                 Me::Say(_) => Cow::Borrowed(OSC_ADDRESS_ME_SAY),
+                Me::SayInRoom(room_say) => Cow::Owned(format!(
+                    "{OSC_ADDRESS_ME_ROOM_PREFIX}{}{OSC_ADDRESS_ME_ROOM_SAY_SUFFIX}",
+                    room_say.room_name
+                )),
                 Me::Listening(_) => Cow::Borrowed(OSC_ADDRESS_ME_LISTENING),
                 Me::ListeningInRoom(listening) => Cow::Owned(format!(
                     "{OSC_ADDRESS_ME_LISTENING_ROOM_PREFIX}{}",
@@ -88,6 +93,7 @@ impl Message {
                 Me::Introduce(user) => user.to_args(),
                 Me::Welcome(user) => user.to_args(),
                 Me::Say(message) => message.to_args(),
+                Me::SayInRoom(room_say) => room_say.say.to_args(),
                 Me::Listening(client) => client.to_args(),
                 Me::ListeningInRoom(listening) => listening.client.to_args(),
                 Me::EnterRoom(room) => room.client.to_args(),
@@ -117,6 +123,7 @@ impl TryFrom<&Message> for OscPacket {
         let room_name = match message {
             Message::Me(Me::EnterRoom(room)) => Some(&room.room_name),
             Message::Me(Me::ExitRoom(room)) => Some(&room.room_name),
+            Message::Me(Me::SayInRoom(room_say)) => Some(&room_say.room_name),
             Message::Me(Me::ListeningInRoom(listening)) => Some(&listening.room_name),
             _ => None,
         };
@@ -197,25 +204,34 @@ impl TryFrom<&OscPacket> for Message {
                             client,
                         ))))
                     }
-                    None => match room_action_from_address(&osc_message.addr) {
-                        Some((room_name, entering)) => {
-                            let client = MessengerClient::from_args(&osc_message.args)?;
-                            if entering {
-                                Ok(Message::Me(Me::EnterRoom(RoomEnter::new(
-                                    room_name.to_string(),
-                                    client,
-                                ))))
-                            } else {
-                                Ok(Message::Me(Me::ExitRoom(RoomExit::new(
-                                    room_name.to_string(),
-                                    client,
-                                ))))
-                            }
+                    None => match room_say_from_address(&osc_message.addr) {
+                        Some(room_name) => {
+                            let say = Say::from_args(&osc_message.args)?;
+                            Ok(Message::Me(Me::SayInRoom(RoomSay::new(
+                                room_name.to_string(),
+                                say,
+                            ))))
                         }
-                        None => Err(MessengerProtocolError::UnknownAddress(format!(
-                            "Unknown OSC address: {}",
-                            osc_message.addr
-                        ))),
+                        None => match room_action_from_address(&osc_message.addr) {
+                            Some((room_name, entering)) => {
+                                let client = MessengerClient::from_args(&osc_message.args)?;
+                                if entering {
+                                    Ok(Message::Me(Me::EnterRoom(RoomEnter::new(
+                                        room_name.to_string(),
+                                        client,
+                                    ))))
+                                } else {
+                                    Ok(Message::Me(Me::ExitRoom(RoomExit::new(
+                                        room_name.to_string(),
+                                        client,
+                                    ))))
+                                }
+                            }
+                            None => Err(MessengerProtocolError::UnknownAddress(format!(
+                                "Unknown OSC address: {}",
+                                osc_message.addr
+                            ))),
+                        },
                     },
                 },
             },
@@ -246,6 +262,17 @@ fn parse_room_name_argument(
 
 fn listening_room_from_address(address: &str) -> Option<&str> {
     let room_name = address.strip_prefix(OSC_ADDRESS_ME_LISTENING_ROOM_PREFIX)?;
+    if room_name.is_empty() || room_name.contains('/') || room_name.contains('\0') {
+        None
+    } else {
+        Some(room_name)
+    }
+}
+
+fn room_say_from_address(address: &str) -> Option<&str> {
+    let room_name = address
+        .strip_prefix(OSC_ADDRESS_ME_ROOM_PREFIX)?
+        .strip_suffix(OSC_ADDRESS_ME_ROOM_SAY_SUFFIX)?;
     if room_name.is_empty() || room_name.contains('/') || room_name.contains('\0') {
         None
     } else {
@@ -302,6 +329,7 @@ pub enum Me {
     Introduce(MessengerClient),
     Welcome(MessengerClient),
     Say(Say),
+    SayInRoom(RoomSay),
     Listening(MessengerClient),
     ListeningInRoom(RoomListening),
     EnterRoom(RoomEnter),
@@ -314,11 +342,32 @@ impl Me {
             Me::Introduce(_) => "introduce",
             Me::Welcome(_) => "welcome",
             Me::Say(_) => "say",
+            Me::SayInRoom(_) => "say",
             Me::Listening(_) => "listening",
             Me::ListeningInRoom(_) => "listening/room",
             Me::EnterRoom(_) => "enter",
             Me::ExitRoom(_) => "exit",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomSay {
+    room_name: String,
+    say: Say,
+}
+
+impl RoomSay {
+    pub fn new(room_name: String, say: Say) -> Self {
+        Self { room_name, say }
+    }
+
+    pub fn room_name(&self) -> &str {
+        &self.room_name
+    }
+
+    pub fn say(&self) -> &Say {
+        &self.say
     }
 }
 

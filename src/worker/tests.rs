@@ -1,4 +1,5 @@
 use super::*;
+use rosc::OscType;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -148,6 +149,39 @@ fn received_in_room_listening_from(
     }
 }
 
+fn received_room_say_from(
+    handle: &OscWorkerHandle,
+    expected_client_uuid: &str,
+    room_name: &str,
+    expected_text: &str,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return false;
+        }
+
+        match handle.event_receiver().recv_timeout(timeout) {
+            Ok(OscWorkerEvent::MessageReceived(_, Message::Me(Me::SayInRoom(room_say)))) => {
+                let args = room_say.say().to_args();
+                if room_say.room_name() == room_name
+                    && args.len() == 3
+                    && args[1] == OscType::String(expected_client_uuid.to_string())
+                    && args[2] == OscType::String(expected_text.to_string())
+                {
+                    return true;
+                }
+            }
+            Ok(OscWorkerEvent::Error(error)) => {
+                eprintln!("wire test worker error: {error:?}");
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
 fn wait_for_message_sent(handle: &OscWorkerHandle) -> bool {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -211,6 +245,11 @@ fn two_workers_exchange_welcomes_over_multicast() {
     second.query_listening_in_room("lobby".to_string()).unwrap();
     let first_received_in_room_listening =
         received_in_room_listening_from(&first, &first_uuid, "lobby");
+    first
+        .say_in_room("lobby".to_string(), "Hello from room".to_string())
+        .unwrap();
+    let second_received_room_say =
+        received_room_say_from(&second, &first_uuid, "lobby", "Hello from room");
 
     first.stop_osc_worker().unwrap();
     second.stop_osc_worker().unwrap();
@@ -236,5 +275,9 @@ fn two_workers_exchange_welcomes_over_multicast() {
     assert!(
         first_received_in_room_listening,
         "in-room client did not receive its listening reply"
+    );
+    assert!(
+        second_received_room_say,
+        "second client did not receive first client's room message"
     );
 }

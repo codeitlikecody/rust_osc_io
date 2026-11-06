@@ -1,8 +1,8 @@
 use crate::config;
 use crate::net::{create_receiver_socket, leave_multicast_group, send_osc_message};
 use crate::protocol::{
-    Me, Message, MessengerClient, MessengerProtocolError, RoomEnter, RoomExit, RoomListening, Say,
-    Who,
+    Me, Message, MessengerClient, MessengerProtocolError, RoomEnter, RoomExit, RoomListening,
+    RoomSay, Say, Who,
 };
 pub use rosc::OscError;
 use rosc::decoder;
@@ -129,6 +129,13 @@ impl OscWorkerHandle {
         self.send_osc(Message::Me(Me::Say(Say::new(
             self.client.client_uuid().to_string(),
             message,
+        ))))
+    }
+
+    pub fn say_in_room(&self, room_name: String, message: String) -> Result<(), io::Error> {
+        self.send_osc(Message::Me(Me::SayInRoom(RoomSay::new(
+            room_name,
+            Say::new(self.client.client_uuid().to_string(), message),
         ))))
     }
 

@@ -67,6 +67,32 @@ fn say_wire_format() {
     );
 }
 
+#[test]
+fn room_say_wire_format() {
+    assert_wire_format(
+        Message::Me(Me::SayInRoom(RoomSay::new(
+            "lobby".to_string(),
+            sample_say(),
+        ))),
+        "/messenger/me/room/lobby/say",
+        &["message_uuid", "client_uuid", "Hello, world!"],
+    );
+}
+
+#[test]
+fn room_say_rejects_empty_or_slash_containing_names() {
+    for room_name in ["", "parent/child"] {
+        let message = Message::Me(Me::SayInRoom(RoomSay::new(
+            room_name.to_string(),
+            sample_say(),
+        )));
+        assert!(matches!(
+            message.to_osc(),
+            Err(MessengerProtocolError::InvalidRoomName(_))
+        ));
+    }
+}
+
 /// Tests Say::from_args and to_args methods for round-trip conversion.
 #[test]
 fn say_round_trip() {

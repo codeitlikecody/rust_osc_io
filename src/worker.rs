@@ -435,6 +435,7 @@ fn response_to(
 
 fn should_deliver_message(message: &Message, current_room: Option<&str>) -> bool {
     match message {
+        Message::Me(Me::Say(_)) => current_room.is_none(),
         Message::Me(Me::SayInRoom(room_say)) => current_room == Some(room_say.room_name()),
         _ => true,
     }

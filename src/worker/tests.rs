@@ -56,6 +56,14 @@ fn does_not_welcome_non_introduction_messages() {
 }
 
 #[test]
+fn global_say_is_delivered_only_to_clients_outside_rooms() {
+    let say = Message::Me(Me::Say(Say::new("sender".to_string(), "hello".to_string())));
+
+    assert!(should_deliver_message(&say, None));
+    assert!(!should_deliver_message(&say, Some("lobby")));
+}
+
+#[test]
 fn room_say_is_delivered_only_to_clients_in_that_room() {
     let say = Message::Me(Me::SayInRoom(RoomSay::new(
         "lobby".to_string(),
@@ -324,6 +332,58 @@ fn received_room_say_from(
     }
 }
 
+fn received_global_say_from(
+    handle: &OscWorkerHandle,
+    expected_client_uuid: &str,
+    expected_message_uuid: &str,
+    expected_text: &str,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return false;
+        }
+
+        match handle.event_receiver().recv_timeout(timeout) {
+            Ok(OscWorkerEvent::MessageReceived(_, Message::Me(Me::Say(say)))) => {
+                let args = say.to_args();
+                if args.len() == 3
+                    && args[0] == OscType::String(expected_message_uuid.to_string())
+                    && args[1] == OscType::String(expected_client_uuid.to_string())
+                    && args[2] == OscType::String(expected_text.to_string())
+                {
+                    return true;
+                }
+            }
+            Ok(OscWorkerEvent::Error(error)) => {
+                eprintln!("wire test worker error: {error:?}");
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+fn did_not_receive_global_say(handle: &OscWorkerHandle, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+
+        match handle.event_receiver().recv_timeout(remaining) {
+            Ok(OscWorkerEvent::MessageReceived(_, Message::Me(Me::Say(_)))) => return false,
+            Ok(OscWorkerEvent::Error(error)) => {
+                eprintln!("wire test worker error: {error:?}");
+            }
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+}
+
 fn did_not_receive_room_say(handle: &OscWorkerHandle, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -406,6 +466,17 @@ fn two_workers_exchange_welcomes_over_multicast() {
         wait_for_message_sent(&first),
         "first client did not enter lobby"
     );
+    second
+        .say_with_uuid(
+            "outside-message-id".to_string(),
+            "Hello outside".to_string(),
+        )
+        .unwrap();
+    let second_sent_global_say = wait_for_message_sent(&second);
+    let second_received_global_say =
+        received_global_say_from(&second, &second_uuid, "outside-message-id", "Hello outside");
+    let first_did_not_receive_global_say =
+        did_not_receive_global_say(&first, Duration::from_millis(500));
     second.query_listening_in_room("lobby".to_string()).unwrap();
     let first_received_in_room_listening =
         received_in_room_listening_from(&first, &first_uuid, "lobby");
@@ -458,6 +529,18 @@ fn two_workers_exchange_welcomes_over_multicast() {
     assert!(
         first_received_in_room_listening,
         "in-room client did not receive its listening reply"
+    );
+    assert!(
+        second_sent_global_say,
+        "outside client did not send its global message"
+    );
+    assert!(
+        second_received_global_say,
+        "outside client did not receive its global message"
+    );
+    assert!(
+        first_did_not_receive_global_say,
+        "in-room client received an outside-room message"
     );
     assert!(
         first_received_room_say,

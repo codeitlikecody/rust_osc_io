@@ -248,10 +248,16 @@ fn spawn_osc_worker(
             return;
         }
     };
-    // set a read timeout so that the thread can check for commands from the main thread periodically
-    socket
-        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
-        .unwrap_or_else(|e| eprintln!("WORKER: Failed to set read timeout: {e}"));
+    // The timeout lets the worker poll commands while waiting for incoming packets.
+    if let Err(error) = socket.set_read_timeout(Some(std::time::Duration::from_millis(100))) {
+        eprintln!("WORKER: Failed to set read timeout: {error}");
+        leave_multicast_group(&socket, multicast_group, listener_address.ip())
+            .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
+        events
+            .send(OscWorkerEvent::Error(OscWorkerError::IoError(error)))
+            .unwrap_or_else(|e| eprintln!("WORKER: Failed to send error event: {e}"));
+        return;
+    }
 
     // Notify the main thread that the worker thread has started successfully
     events

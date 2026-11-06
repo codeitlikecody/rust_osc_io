@@ -65,17 +65,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    match osc_worker_handle.stop_osc_worker() {
-        Ok(_) => {
+    match osc_worker_handle.join() {
+        Ok(()) => {
             println!("Worker thread stopped successfully. Program exiting...");
             Ok(())
         }
-        Err(error) => {
-            eprintln!("Failed to stop worker: {error}");
+        Err(_) => {
+            eprintln!("Worker thread panicked during shutdown");
             println!("Program exiting...");
             Err(Box::new(io::Error::new(
                 io::ErrorKind::Other,
-                "Failed to stop worker thread",
+                "Worker thread panicked during shutdown",
             )))
         }
     }

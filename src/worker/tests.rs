@@ -12,6 +12,21 @@ fn client(client_uuid: &str) -> MessengerClient {
 }
 
 #[test]
+fn configured_client_uses_persisted_uuid() {
+    let config = config::Config::default().set_client_uuid("saved-client-id".to_string());
+
+    assert_eq!(configured_client(&config).client_uuid(), "saved-client-id");
+}
+
+#[test]
+fn configured_client_generates_uuid_when_missing() {
+    let config = config::Config::default();
+    let client = configured_client(&config);
+
+    assert!(uuid::Uuid::parse_str(client.client_uuid()).is_ok());
+}
+
+#[test]
 fn welcomes_other_introducing_clients_with_own_identity() {
     let local_client = client("local");
     let introduced_client = client("remote");

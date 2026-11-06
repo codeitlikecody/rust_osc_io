@@ -51,7 +51,7 @@ impl OscWorkerHandle {
         // Create channels for controlling the receiver and returning events
         let (commands_tx, commands_rx) = mpsc::channel::<OscCommand>();
         let (events_tx, events_rx) = mpsc::channel::<OscWorkerEvent>();
-        let client = MessengerClient::new(config.client_name, config.application_name);
+        let client = configured_client(&config);
         let worker_client = client.clone();
         let thread = thread::spawn(move || {
             spawn_osc_worker(
@@ -110,6 +110,10 @@ impl OscWorkerHandle {
     /// Returns a reference to the receiver for events from the worker thread.
     pub fn event_receiver(&self) -> &mpsc::Receiver<OscWorkerEvent> {
         &self.events_rx
+    }
+
+    pub fn client_uuid(&self) -> &str {
+        self.client.client_uuid()
     }
 
     /// Sends a command to the worker thread to stop it.
@@ -175,6 +179,17 @@ impl OscWorkerHandle {
 
     pub fn join(self) -> thread::Result<()> {
         self.thread.join()
+    }
+}
+
+fn configured_client(config: &config::Config) -> MessengerClient {
+    match &config.client_uuid {
+        Some(client_uuid) => MessengerClient::new_with_uuid(
+            client_uuid.clone(),
+            config.client_name.clone(),
+            config.application_name.clone(),
+        ),
+        None => MessengerClient::new(config.client_name.clone(), config.application_name.clone()),
     }
 }
 

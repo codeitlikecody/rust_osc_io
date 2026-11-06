@@ -20,6 +20,7 @@ pub struct Config {
     pub sender_address: SocketAddrV4,
     pub client_name: String,
     pub application_name: String,
+    pub client_uuid: Option<String>,
 }
 impl Default for Config {
     /// Create a new Config instance with the default parameters.
@@ -32,6 +33,7 @@ impl Default for Config {
             sender_address: SocketAddrV4::new(DEFAULT_SENDER_ADDRESS, DEFAULT_SENDER_PORT),
             client_name: DEFAULT_CLIENT_NAME.to_string(),
             application_name: DEFAULT_APPLICATION_NAME.to_string(),
+            client_uuid: None,
         }
     }
 }
@@ -66,6 +68,7 @@ impl Config {
             sender_address,
             client_name,
             application_name,
+            client_uuid: None,
         }
     }
 
@@ -81,6 +84,7 @@ impl Config {
             sender_address: self.sender_address,
             client_name,
             application_name: self.application_name.clone(),
+            client_uuid: self.client_uuid.clone(),
         }
     }
 
@@ -96,6 +100,19 @@ impl Config {
             sender_address: self.sender_address,
             client_name: self.client_name.clone(),
             application_name,
+            client_uuid: self.client_uuid.clone(),
+        }
+    }
+
+    /// Set a previously persisted client UUID. If omitted, the worker generates one.
+    pub fn set_client_uuid(&mut self, client_uuid: String) -> Self {
+        Config {
+            multicast_group: self.multicast_group,
+            listener_address: self.listener_address,
+            sender_address: self.sender_address,
+            client_name: self.client_name.clone(),
+            application_name: self.application_name.clone(),
+            client_uuid: Some(client_uuid),
         }
     }
 }

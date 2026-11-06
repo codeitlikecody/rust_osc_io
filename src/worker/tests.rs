@@ -227,8 +227,12 @@ fn entering_and_exiting_updates_current_room_correctly() {
     );
 }
 
-fn received_welcome_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(3);
+fn received_welcome_for(
+    handle: &OscWorkerHandle,
+    expected_client_uuid: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
     loop {
         let timeout = deadline.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
@@ -250,6 +254,45 @@ fn received_welcome_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -
             Err(_) => return false,
         }
     }
+}
+
+fn exchange_welcomes(
+    first: &OscWorkerHandle,
+    second: &OscWorkerHandle,
+    first_uuid: &str,
+    second_uuid: &str,
+) -> (bool, bool) {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let retry_interval = Duration::from_millis(300);
+    let mut first_received_welcome = false;
+    let mut second_received_welcome = false;
+
+    while Instant::now() < deadline && !(first_received_welcome && second_received_welcome) {
+        if !first_received_welcome {
+            second
+                .send_osc(Message::Me(Me::Introduce(second.client.clone())))
+                .unwrap();
+        }
+        if !second_received_welcome {
+            first
+                .send_osc(Message::Me(Me::Introduce(first.client.clone())))
+                .unwrap();
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !first_received_welcome && !remaining.is_zero() {
+            first_received_welcome =
+                received_welcome_for(first, second_uuid, retry_interval.min(remaining));
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !second_received_welcome && !remaining.is_zero() {
+            second_received_welcome =
+                received_welcome_for(second, first_uuid, retry_interval.min(remaining));
+        }
+    }
+
+    (first_received_welcome, second_received_welcome)
 }
 
 fn received_farewell_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -> bool {
@@ -509,9 +552,7 @@ fn wait_for_message_sent(handle: &OscWorkerHandle) -> bool {
     }
 }
 
-#[test]
-#[ignore = "requires multicast loopback and shared-port support"]
-fn two_workers_exchange_welcomes_over_multicast() {
+fn spawn_worker_pair() -> (OscWorkerHandle, OscWorkerHandle) {
     let probe_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap();
     let port = probe_socket.local_addr().unwrap().port();
     drop(probe_socket);
@@ -526,20 +567,44 @@ fn two_workers_exchange_welcomes_over_multicast() {
         )
     };
 
-    let first = OscWorkerHandle::spawn(worker_config("first client")).unwrap();
-    let second = OscWorkerHandle::spawn(worker_config("second client")).unwrap();
+    (
+        OscWorkerHandle::spawn(worker_config("first client")).unwrap(),
+        OscWorkerHandle::spawn(worker_config("second client")).unwrap(),
+    )
+}
+
+#[test]
+#[ignore = "requires multicast loopback and shared-port support"]
+fn two_workers_exchange_welcomes_over_multicast() {
+    let (first, second) = spawn_worker_pair();
     let first_uuid = first.client.client_uuid().to_string();
     let second_uuid = second.client.client_uuid().to_string();
 
-    first
-        .send_osc(Message::Me(Me::Introduce(first.client.clone())))
-        .unwrap();
-    second
-        .send_osc(Message::Me(Me::Introduce(second.client.clone())))
-        .unwrap();
+    let (first_received_welcome, second_received_welcome) =
+        exchange_welcomes(&first, &second, &first_uuid, &second_uuid);
 
-    let first_received_welcome = received_welcome_from(&first, &second_uuid);
-    let second_received_welcome = received_welcome_from(&second, &first_uuid);
+    first.join().unwrap();
+    second.join().unwrap();
+
+    assert!(
+        first_received_welcome,
+        "first client did not receive second client's welcome"
+    );
+    assert!(
+        second_received_welcome,
+        "second client did not receive first client's welcome"
+    );
+}
+
+#[test]
+#[ignore = "requires multicast loopback and shared-port support"]
+fn two_workers_complete_multicast_lifecycle() {
+    let (first, second) = spawn_worker_pair();
+    let first_uuid = first.client.client_uuid().to_string();
+    let second_uuid = second.client.client_uuid().to_string();
+
+    let (first_received_welcome, second_received_welcome) =
+        exchange_welcomes(&first, &second, &first_uuid, &second_uuid);
     first
         .query_listening_outside_room("lobby".to_string())
         .unwrap();

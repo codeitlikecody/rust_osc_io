@@ -71,6 +71,15 @@ function roomFromAddress(address: string) {
   return address.slice(prefix.length, -suffix.length);
 }
 
+function roomPresenceFromAddress(address: string) {
+  const prefix = "/messenger/me/room/";
+  const suffix = address.startsWith(prefix) ? address.slice(prefix.length) : "";
+  const action = suffix.endsWith("/enter") ? "enter" : suffix.endsWith("/exit") ? "exit" : null;
+  if (!action) return null;
+  const room = suffix.slice(0, -(action.length + 1));
+  return room && !room.includes("/") ? { room, action } : null;
+}
+
 function formatTime(timestamp: number) {
   return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(timestamp);
 }
@@ -118,6 +127,24 @@ export default function App() {
       if (payload.kind !== "message_received") return;
 
       const { address, args } = payload;
+      if (address === "/messenger/me/farewell" && args.length >= 1) {
+        setContacts((current) => current.filter((contact) => contact.id !== args[0]));
+        return;
+      }
+
+      const roomPresence = roomPresenceFromAddress(address);
+      if (roomPresence?.room === activeRoom && args.length >= 3 && args[0] !== clientUuid) {
+        const [id, name, application] = args;
+        if (roomPresence.action === "exit") {
+          setContacts((current) => current.filter((contact) => contact.id !== id));
+        } else {
+          setContacts((current) => current.some((contact) => contact.id === id)
+            ? current.map((contact) => contact.id === id ? { ...contact, name, application } : contact)
+            : [...current, { id, name, application }]);
+        }
+        return;
+      }
+
       const room = roomFromAddress(address);
       if ((address === "/messenger/me/say" || room !== null) && args.length >= 3) {
         const [id, senderId, text] = args;

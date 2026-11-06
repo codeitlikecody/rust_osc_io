@@ -1,9 +1,13 @@
+use std::borrow::Cow;
+
 use rosc::{OscMessage, OscPacket, OscType};
 
 const OSC_ADDRESS_ME_INTRODUCE: &str = "/messenger/me/introduce";
 const OSC_ADDRESS_ME_WELCOME: &str = "/messenger/me/welcome";
 const OSC_ADDRESS_ME_SAY: &str = "/messenger/me/say";
 const OSC_ADDRESS_WHO: &str = "/messenger/who";
+const OSC_ADDRESS_ME_ROOM_PREFIX: &str = "/messenger/me/room/";
+const OSC_ADDRESS_ME_ROOM_ENTER_SUFFIX: &str = "/enter";
 
 /// Protocol error type for the messenger application. This enum represents the different types of errors that can occur when parsing or constructing messages in the messenger protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +18,7 @@ pub enum MessengerProtocolError {
     NotImplemented(String),
     BundleNotSupported,
     NullByteInString(String),
+    InvalidRoomName(String),
 }
 impl std::fmt::Display for MessengerProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -27,6 +32,7 @@ impl std::fmt::Display for MessengerProtocolError {
                 "Null byte in string: {s} - OSC is null terminated, so this is not allowed"
             ),
             Self::BundleNotSupported => write!(f, "OSC bundles are not supported"),
+            Self::InvalidRoomName(name) => write!(f, "Invalid room name: {name}"),
         }
     }
 }
@@ -44,14 +50,18 @@ pub enum Message {
 /// This implementation provides methods to get the OSC address and arguments for each type of MessengerMessage, as well as a method to convert the message into an OscPacket.
 impl Message {
     /// Returns the OSC address of the message.
-    pub fn address(&self) -> &'static str {
+    pub fn address(&self) -> Cow<'static, str> {
         match self {
             Message::Me(me_message) => match me_message {
-                Me::Introduce(_) => OSC_ADDRESS_ME_INTRODUCE,
-                Me::Welcome(_) => OSC_ADDRESS_ME_WELCOME,
-                Me::Say(_) => OSC_ADDRESS_ME_SAY,
+                Me::Introduce(_) => Cow::Borrowed(OSC_ADDRESS_ME_INTRODUCE),
+                Me::Welcome(_) => Cow::Borrowed(OSC_ADDRESS_ME_WELCOME),
+                Me::Say(_) => Cow::Borrowed(OSC_ADDRESS_ME_SAY),
+                Me::EnterRoom(room) => Cow::Owned(format!(
+                    "{OSC_ADDRESS_ME_ROOM_PREFIX}{}{OSC_ADDRESS_ME_ROOM_ENTER_SUFFIX}",
+                    room.room_name
+                )),
             },
-            Message::Who(_) => OSC_ADDRESS_WHO,
+            Message::Who(_) => Cow::Borrowed(OSC_ADDRESS_WHO),
         }
     }
 
@@ -62,6 +72,7 @@ impl Message {
                 Me::Introduce(user) => user.to_args(),
                 Me::Welcome(user) => user.to_args(),
                 Me::Say(message) => message.to_args(),
+                Me::EnterRoom(room) => room.client.to_args(),
             },
             // TODO: Placeholder for Who message arguments.
             Message::Who(_) => vec![],
@@ -79,6 +90,13 @@ impl TryFrom<&Message> for OscPacket {
     fn try_from(message: &Message) -> Result<OscPacket, MessengerProtocolError> {
         let address = message.address();
         let args = message.args();
+        if let Message::Me(Me::EnterRoom(room)) = message {
+            if room.room_name.is_empty() || room.room_name.contains('/') {
+                return Err(MessengerProtocolError::InvalidRoomName(
+                    room.room_name.clone(),
+                ));
+            }
+        }
         // Check for null bytes in address or string arguments, as OSC strings are null-terminated and cannot contain null bytes.
         for arg in &args {
             if let OscType::String(s) = arg {
@@ -97,7 +115,7 @@ impl TryFrom<&Message> for OscPacket {
             )));
         }
         Ok(OscPacket::Message(OscMessage {
-            addr: address.to_string(),
+            addr: address.into_owned(),
             args,
         }))
     }
@@ -135,14 +153,34 @@ impl TryFrom<&OscPacket> for Message {
                     OSC_ADDRESS_WHO => Err(MessengerProtocolError::NotImplemented(
                         "Who message parsing not implemented".into(),
                     )),
-                    _ => Err(MessengerProtocolError::UnknownAddress(format!(
-                        "Unknown OSC address: {}",
-                        osc_message.addr
-                    ))),
+                    _ => match room_name_from_address(&osc_message.addr) {
+                        Some(room_name) => {
+                            let client = MessengerClient::from_args(&osc_message.args)?;
+                            Ok(Message::Me(Me::EnterRoom(RoomEnter::new(
+                                room_name.to_string(),
+                                client,
+                            ))))
+                        }
+                        None => Err(MessengerProtocolError::UnknownAddress(format!(
+                            "Unknown OSC address: {}",
+                            osc_message.addr
+                        ))),
+                    },
                 }
             }
             OscPacket::Bundle(_) => Err(MessengerProtocolError::BundleNotSupported),
         }
+    }
+}
+
+fn room_name_from_address(address: &str) -> Option<&str> {
+    let room_name = address
+        .strip_prefix(OSC_ADDRESS_ME_ROOM_PREFIX)?
+        .strip_suffix(OSC_ADDRESS_ME_ROOM_ENTER_SUFFIX)?;
+    if room_name.is_empty() || room_name.contains('/') || room_name.contains('\0') {
+        None
+    } else {
+        Some(room_name)
     }
 }
 
@@ -166,6 +204,7 @@ pub enum Me {
     Introduce(MessengerClient),
     Welcome(MessengerClient),
     Say(Say),
+    EnterRoom(RoomEnter),
 }
 impl Me {
     /// Returns part of the OSC address for the message type.
@@ -174,7 +213,28 @@ impl Me {
             Me::Introduce(_) => "introduce",
             Me::Welcome(_) => "welcome",
             Me::Say(_) => "say",
+            Me::EnterRoom(_) => "enter",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomEnter {
+    room_name: String,
+    client: MessengerClient,
+}
+
+impl RoomEnter {
+    pub fn new(room_name: String, client: MessengerClient) -> Self {
+        Self { room_name, client }
+    }
+
+    pub fn room_name(&self) -> &str {
+        &self.room_name
+    }
+
+    pub fn client(&self) -> &MessengerClient {
+        &self.client
     }
 }
 

@@ -169,6 +169,33 @@ fn welcome_wire_format() {
     );
 }
 
+/// Test the room-enter address and client payload encoding/decoding.
+#[test]
+fn room_enter_wire_format() {
+    assert_wire_format(
+        Message::Me(Me::EnterRoom(RoomEnter::new(
+            "lobby one".to_string(),
+            sample_client(),
+        ))),
+        "/messenger/me/room/lobby one/enter",
+        &["client_uuid", "Alice", "Protocol Test Client"],
+    );
+}
+
+#[test]
+fn room_enter_rejects_empty_or_slash_containing_names() {
+    for room_name in ["", "parent/child"] {
+        let message = Message::Me(Me::EnterRoom(RoomEnter::new(
+            room_name.to_string(),
+            sample_client(),
+        )));
+        assert!(matches!(
+            message.to_osc(),
+            Err(MessengerProtocolError::InvalidRoomName(_))
+        ));
+    }
+}
+
 /// Tests MessengerClient::from_args and to_args methods for round-trip conversion.
 #[test]
 fn messenger_client_round_trip() {
@@ -251,6 +278,19 @@ fn message_try_from_introduce_bad_args() {
     let packet = packet(
         "/messenger/me/introduce",
         string_args(&["client_uuid", "Alice"]), // missing application name
+    );
+    let err = Message::try_from(&packet).unwrap_err();
+    assert!(matches!(
+        err,
+        MessengerProtocolError::InvalidArgumentCount(_)
+    ));
+}
+
+#[test]
+fn message_try_from_room_enter_bad_args() {
+    let packet = packet(
+        "/messenger/me/room/lobby/enter",
+        string_args(&["client_uuid", "Alice"]),
     );
     let err = Message::try_from(&packet).unwrap_err();
     assert!(matches!(

@@ -35,10 +35,10 @@ type Contact = { id: string; name: string; application: string };
 
 type SavedIdentity = {
   clientName: string;
-  applicationName: string;
   clientUuid: string;
 };
 
+const APPLICATION_NAME = "OSCMessenger";
 const IDENTITY_KEY = "oscmessenger.identity.v1";
 const GLOBAL_PRESENCE_QUERY_ROOM = "__OSCMESSENGER_GLOBAL_PRESENCE__";
 const desktopBridgeAvailable = "__TAURI_INTERNALS__" in window;
@@ -54,14 +54,13 @@ function loadIdentity(): SavedIdentity {
       const parsed = JSON.parse(saved) as Partial<SavedIdentity>;
       return {
         clientName: parsed.clientName || "Stage client",
-        applicationName: parsed.applicationName || "OSCMessenger",
         clientUuid: parsed.clientUuid || newUuid(),
       };
     }
   } catch {
     localStorage.removeItem(IDENTITY_KEY);
   }
-  return { clientName: "Stage client", applicationName: "OSCMessenger", clientUuid: newUuid() };
+  return { clientName: "Stage client", clientUuid: newUuid() };
 }
 
 function roomFromAddress(address: string) {
@@ -183,20 +182,19 @@ export default function App() {
   const visibleMessages = messages.filter((message) => message.room === displayRoom);
   const visibleContacts = contacts;
 
-  function updateIdentity(field: "clientName" | "applicationName", value: string) {
+  function updateIdentity(field: "clientName", value: string) {
     setIdentity((current) => ({ ...current, [field]: value }));
   }
 
   async function connect() {
     if (!desktopBridgeAvailable) return;
-    if (!identity.clientName.trim() || !identity.applicationName.trim()) {
-      setNotice("Add a client name and application name first.");
+    if (!identity.clientName.trim()) {
+      setNotice("Add a callsign first.");
       return;
     }
     try {
       const result = await invoke<{ client_uuid: string }>("connect", {
         clientName: identity.clientName.trim(),
-        applicationName: identity.applicationName.trim(),
         clientUuid: identity.clientUuid,
       });
       setClientUuid(result.client_uuid);
@@ -303,8 +301,8 @@ export default function App() {
           <div className="section-label">YOUR STATION</div>
           <label className="field-label" htmlFor="client-name">Callsign</label>
           <input id="client-name" value={identity.clientName} maxLength={48} onChange={(event) => updateIdentity("clientName", event.target.value)} disabled={connected} />
-          <label className="field-label" htmlFor="application-name">Application</label>
-          <input id="application-name" value={identity.applicationName} maxLength={48} onChange={(event) => updateIdentity("applicationName", event.target.value)} disabled={connected} />
+          <div className="field-label">Application</div>
+          <div className="application-value">{APPLICATION_NAME}</div>
           <button className={`connection-button ${connected ? "is-connected" : ""}`} onClick={connected ? disconnect : connect} disabled={!desktopBridgeAvailable}>
             <span className="connection-indicator" />
             {connected ? "Disconnect" : "Connect to OSC"}
@@ -379,7 +377,7 @@ export default function App() {
       <aside className="details-panel">
         <div className="details-header"><div className="section-label">CHANNEL DETAILS</div><div className="details-channel"><div className="details-channel-icon">{displayRoom ? <Hash size={16} /> : <Radio size={16} />}</div><div><strong>{displayRoom || "Global"}</strong><span>{activeRoom ? "ROOM" : sendToRoom ? "DIRECT TARGET" : "MULTICAST"}</span></div></div></div>
         <div className="roster-section"><div className="roster-heading"><span>ON CHANNEL</span><span className="roster-count">{visibleContacts.length + (connected ? 1 : 0)}</span></div>
-          {connected && <div className="roster-person"><div className="roster-avatar local">{identity.clientName.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{identity.clientName || "Unnamed station"}</strong><span>YOU · {identity.applicationName}</span></div><span className="roster-presence" /></div>}
+          {connected && <div className="roster-person"><div className="roster-avatar local">{identity.clientName.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{identity.clientName || "Unnamed station"}</strong><span>YOU · {APPLICATION_NAME}</span></div><span className="roster-presence" /></div>}
           {visibleContacts.map((contact) => <div className="roster-person" key={contact.id}><div className="roster-avatar">{contact.name.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{contact.name}</strong><span>{contact.application}</span></div><span className="roster-presence" /></div>)}
           {!connected && <div className="roster-empty"><UsersRound size={17} /><span>No stations connected</span></div>}
           {connected && visibleContacts.length === 0 && <div className="roster-empty"><UsersRound size={17} /><span>Only you, for now</span></div>}

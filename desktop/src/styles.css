@@ -305,6 +305,17 @@ textarea:focus-visible {
     outline: 0;
     font-size: 11px;
 }
+.application-value {
+    display: flex;
+    align-items: center;
+    height: 34px;
+    padding: 0 9px;
+    color: #a7b0aa;
+    background: #111613;
+    border: 1px solid #29312c;
+    border-radius: 3px;
+    font-size: 12px;
+}
 
 .room-input-wrap input::placeholder {
     color: #5f6b63;

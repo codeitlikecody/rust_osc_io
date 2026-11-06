@@ -8,6 +8,8 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+const APPLICATION_NAME: &str = "OSCMessenger";
+
 #[derive(Default)]
 struct Session {
     worker: Option<OscWorkerHandle>,
@@ -49,7 +51,6 @@ fn connect(
     app: AppHandle,
     state: State<'_, AppState>,
     client_name: String,
-    application_name: String,
     client_uuid: Option<String>,
 ) -> Result<ConnectionInfo, String> {
     let mut session = lock_session(&state);
@@ -59,7 +60,7 @@ fn connect(
 
     let mut config = Config::default()
         .set_name(client_name)
-        .set_application_name(application_name);
+        .set_application_name(APPLICATION_NAME.to_string());
     if let Some(client_uuid) = client_uuid.filter(|value| !value.trim().is_empty()) {
         config = config.set_client_uuid(client_uuid);
     }

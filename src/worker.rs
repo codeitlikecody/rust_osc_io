@@ -48,6 +48,8 @@ impl OscWorkerHandle {
         // Create channels for controlling the receiver and returning events
         let (commands_tx, commands_rx) = mpsc::channel::<OscCommand>();
         let (events_tx, events_rx) = mpsc::channel::<OscWorkerEvent>();
+        let client = MessengerClient::new(config.client_name, config.application_name);
+        let worker_client = client.clone();
         let thread = thread::spawn(move || {
             spawn_osc_worker(
                 config.multicast_group,
@@ -55,6 +57,7 @@ impl OscWorkerHandle {
                 config.sender_address,
                 commands_rx,
                 events_tx,
+                worker_client,
             )
         });
 
@@ -85,7 +88,6 @@ impl OscWorkerHandle {
                 ));
             }
         }
-        let client = MessengerClient::new(config.client_name, config.application_name);
         let handle = OscWorkerHandle {
             commands_tx,
             events_rx,
@@ -159,6 +161,7 @@ fn spawn_osc_worker(
     sender_address: SocketAddrV4,
     commands: mpsc::Receiver<OscCommand>,
     events: mpsc::Sender<OscWorkerEvent>,
+    client: MessengerClient,
 ) -> () {
     let mut buffer = [0u8; 65536];
     let destination = SocketAddrV4::new(multicast_group, listener_address.port());
@@ -233,11 +236,30 @@ fn spawn_osc_worker(
                 Ok((_, packet)) => {
                     match packet.try_into() {
                         Ok(message) => {
+                            let welcome = welcome_response(&message, &client);
                             events
-                            .send(OscWorkerEvent::MessageReceived(sender, message))
-                            .unwrap_or_else(|e| {
-                                eprintln!("Worker Error 822: Failed to send message received event: {e}")
-                            });
+                                .send(OscWorkerEvent::MessageReceived(sender, message))
+                                .unwrap_or_else(|e| {
+                                    eprintln!("Worker Error 822: Failed to send message received event: {e}")
+                                });
+                            if let Some(welcome) = welcome {
+                                match send_osc_message(destination, sender_address, welcome) {
+                                    Ok(bytes_sent) => {
+                                        events
+                                            .send(OscWorkerEvent::MessageSent(bytes_sent))
+                                            .unwrap_or_else(|e| {
+                                                eprintln!("WORKER: Failed to send event: {e}")
+                                            });
+                                    }
+                                    Err(error) => {
+                                        events.send(OscWorkerEvent::Error(error)).unwrap_or_else(
+                                            |e| {
+                                                eprintln!("WORKER: Failed to send error event: {e}")
+                                            },
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(error) => {
                             eprintln!(
@@ -278,3 +300,17 @@ fn spawn_osc_worker(
         }
     }
 }
+
+fn welcome_response(message: &Message, client: &MessengerClient) -> Option<Message> {
+    match message {
+        Message::Me(Me::Introduce(introduced_client))
+            if introduced_client.client_uuid() != client.client_uuid() =>
+        {
+            Some(Message::Me(Me::Welcome(client.clone())))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests;

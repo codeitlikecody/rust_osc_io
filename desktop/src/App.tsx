@@ -40,8 +40,33 @@ type SavedIdentity = {
 
 const APPLICATION_NAME = "OSCMessenger";
 const IDENTITY_KEY = "oscmessenger.identity.v1";
+const RECENT_ROOMS_KEY = "oscmessenger.recent-rooms.v1";
+const MAX_RECENT_ROOMS = 20;
 const GLOBAL_PRESENCE_QUERY_ROOM = "__OSCMESSENGER_GLOBAL_PRESENCE__";
 const desktopBridgeAvailable = "__TAURI_INTERNALS__" in window;
+const RECOMMENDED_ROOMS = [
+  { name: "LX", role: "Lighting" },
+  { name: "SM", role: "Stage management" },
+  { name: "SX", role: "Sound" },
+  { name: "MX", role: "Mechanist / staging" },
+  { name: "DECK", role: "Deck crew" },
+  { name: "RIGGING", role: "Rigging" },
+  { name: "PROPS", role: "Props" },
+  { name: "WARDROBE", role: "Wardrobe" },
+  { name: "SCENIC", role: "Scenic" },
+  { name: "VIDEO", role: "Video" },
+  { name: "FOH", role: "Front of house" },
+  { name: "PRODUCTION", role: "Production" },
+];
+
+function roomRole(roomName: string) {
+  return RECOMMENDED_ROOMS.find((room) => room.name === roomName)?.role;
+}
+
+function formatRoomName(roomName: string) {
+  const role = roomRole(roomName);
+  return role ? `${roomName} · ${role}` : roomName;
+}
 
 function newUuid() {
   return crypto.randomUUID().toUpperCase();
@@ -61,6 +86,30 @@ function loadIdentity(): SavedIdentity {
     localStorage.removeItem(IDENTITY_KEY);
   }
   return { clientName: "Stage client", clientUuid: newUuid() };
+}
+
+function loadRecentRooms(): string[] {
+  try {
+    const saved = localStorage.getItem(RECENT_ROOMS_KEY);
+    if (!saved) return [];
+    const parsed: unknown = JSON.parse(saved);
+    if (!Array.isArray(parsed)) return [];
+
+    const rooms: string[] = [];
+    const seen = new Set<string>();
+    for (const value of parsed) {
+      if (typeof value !== "string") continue;
+      const room = value.trim();
+      const key = room;
+      if (!room || room.includes("/") || room.includes("\0") || seen.has(key)) continue;
+      seen.add(key);
+      rooms.push(room);
+      if (rooms.length === MAX_RECENT_ROOMS) break;
+    }
+    return rooms;
+  } catch {
+    return [];
+  }
 }
 
 function roomFromAddress(address: string) {
@@ -91,6 +140,7 @@ export default function App() {
   const [sendToRoom, setSendToRoom] = useState(false);
   const [sendRoom, setSendRoom] = useState("");
   const [roomDraft, setRoomDraft] = useState("");
+  const [recentRooms, setRecentRooms] = useState(loadRecentRooms);
   const [messageDraft, setMessageDraft] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [contacts, setContacts] = useState<Contact[]>([]);
@@ -102,6 +152,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(IDENTITY_KEY, JSON.stringify(identity));
   }, [identity]);
+
+  useEffect(() => {
+    localStorage.setItem(RECENT_ROOMS_KEY, JSON.stringify(recentRooms));
+  }, [recentRooms]);
 
   useEffect(() => {
     if (!desktopBridgeAvailable) return;
@@ -181,6 +235,16 @@ export default function App() {
   const displayRoom = activeRoom ?? (sendToRoom ? sendRoom.trim() || null : null);
   const visibleMessages = messages.filter((message) => message.room === displayRoom);
   const visibleContacts = contacts;
+  const roomSearch = roomDraft.trim().toLowerCase();
+  const recentRoomSuggestions = recentRooms
+    .filter((room) => room.toLowerCase().includes(roomSearch))
+    .map((name) => ({
+      name,
+      role: roomRole(name) ?? "Recent room",
+    }));
+  const recentRoomNames = new Set(recentRooms);
+  const recommendedRoomSuggestions = RECOMMENDED_ROOMS.filter((room) =>
+    !recentRoomNames.has(room.name) && room.name.toLowerCase().includes(roomSearch));
 
   function updateIdentity(field: "clientName", value: string) {
     setIdentity((current) => ({ ...current, [field]: value }));
@@ -218,15 +282,18 @@ export default function App() {
     }
   }
 
-  async function enterRoom(event: FormEvent) {
-    event.preventDefault();
-    const room = roomDraft.trim();
-    if (!room || room.includes("/")) {
+  async function joinRoom(roomName: string) {
+    const room = roomName.trim();
+    if (!room || room.includes("/") || room.includes("\0")) {
       setNotice("Room names cannot be empty or contain a slash.");
       return;
     }
     if (!connected) {
       setNotice("Connect before entering a room.");
+      return;
+    }
+    if (activeRoom === room) {
+      setRoomDraft("");
       return;
     }
     try {
@@ -235,13 +302,21 @@ export default function App() {
       }
       await invoke("enter_room", { roomName: room });
       setActiveRoom(room);
+      setSendToRoom(false);
+      setSendRoom("");
       setRoomDraft("");
+      setRecentRooms((current) => [room, ...current.filter((recent) => recent !== room)].slice(0, MAX_RECENT_ROOMS));
       setContacts([]);
       await invoke("query_listening", { roomName: room, withinRoom: true });
       setNotice("");
     } catch (error) {
       setNotice(String(error));
     }
+  }
+
+  async function enterRoom(event: FormEvent) {
+    event.preventDefault();
+    await joinRoom(roomDraft);
   }
 
   async function leaveRoom() {
@@ -255,6 +330,12 @@ export default function App() {
     } catch (error) {
       setNotice(String(error));
     }
+  }
+
+  async function selectGlobalChannel() {
+    setSendToRoom(false);
+    setSendRoom("");
+    if (activeRoom) await leaveRoom();
   }
 
   async function sendMessage(event: FormEvent) {
@@ -289,6 +370,18 @@ export default function App() {
     }
   }
 
+  function renderRoomSuggestion(room: { name: string; role: string }) {
+    return <button
+      type="button"
+      key={room.name.toLowerCase()}
+      className={`recommended-room ${activeRoom === room.name ? "selected" : ""}`}
+      onClick={() => void joinRoom(room.name)}
+      disabled={!connected}
+      title={room.role}
+      aria-label={`Enter ${room.name}, ${room.role}`}
+    ><span className="recommended-room-name">#{room.name}</span><span className="recommended-room-role">{room.role}</span></button>;
+  }
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
@@ -313,14 +406,25 @@ export default function App() {
 
         <div className="channels-block">
           <div className="section-heading"><span className="section-label">CHANNEL</span><span className="live-dot" /></div>
-          <div className={`channel-row ${activeRoom ? "" : "selected"}`}>
+          <button type="button" className={`channel-row channel-row-button ${!activeRoom && !sendToRoom ? "selected" : ""}`} onClick={() => void selectGlobalChannel()} aria-current={!activeRoom && !sendToRoom ? "page" : undefined} title="Switch to global channel">
             <MessageSquareText size={16} /><span>Global</span><span className="channel-tag">ALL</span>
-          </div>
-          {activeRoom && <div className="channel-row selected room-active"><Hash size={16} /><span>{activeRoom}</span><button aria-label="Leave room" title="Leave room" onClick={leaveRoom}><DoorOpen size={15} /></button></div>}
+          </button>
+          {activeRoom && <div className="channel-row selected room-active"><Hash size={16} /><span className="active-room-copy"><strong>#{activeRoom}</strong><small>{roomRole(activeRoom) ?? "Custom room"}</small></span><button aria-label="Leave room" title="Leave room" onClick={leaveRoom}><DoorOpen size={15} /></button></div>}
           <form className="room-form" onSubmit={enterRoom}>
             <label htmlFor="room-name">ENTER A ROOM</label>
-            <div className="room-input-wrap"><Hash size={15} /><input id="room-name" value={roomDraft} onChange={(event) => setRoomDraft(event.target.value)} placeholder="room name" maxLength={64} disabled={!connected} /><button title="Enter room" aria-label="Enter room" disabled={!connected || !roomDraft.trim()}><ArrowUpRight size={16} /></button></div>
+            <div className="room-input-wrap"><Hash size={15} /><input id="room-name" value={roomDraft} onChange={(event) => setRoomDraft(event.target.value)} placeholder="room name" maxLength={64} /><button title="Enter room" aria-label="Enter room" disabled={!connected || !roomDraft.trim()}><ArrowUpRight size={16} /></button></div>
           </form>
+          <div className="recommended-rooms">
+            {recentRoomSuggestions.length > 0 && <div className="room-suggestion-section">
+              <div className="recommended-heading">RECENT ROOMS</div>
+              <div className="recommended-grid">{recentRoomSuggestions.map(renderRoomSuggestion)}</div>
+            </div>}
+            {recommendedRoomSuggestions.length > 0 && <div className="room-suggestion-section">
+              <div className="recommended-heading">{roomSearch ? "MATCHING ROOMS" : "RECOMMENDED ROOMS"}</div>
+              <div className="recommended-grid">{recommendedRoomSuggestions.map(renderRoomSuggestion)}</div>
+            </div>}
+            {roomSearch && recentRoomSuggestions.length === 0 && recommendedRoomSuggestions.length === 0 && <div className="no-room-matches">No matching rooms</div>}
+          </div>
         </div>
 
         <div className="sidebar-bottom">
@@ -331,7 +435,7 @@ export default function App() {
 
       <section className="main-panel">
         <header className="topbar">
-          <div className="channel-title"><div className="channel-icon">{displayRoom ? <Hash size={18} /> : <Radio size={18} />}</div><div><h1>{displayRoom || "Global channel"}</h1><p>{activeRoom ? "ROOM TRANSMISSION" : sendToRoom ? "ROOM SEND ONLY" : "OPEN TRANSMISSION"}<span className="title-separator">/</span>{connected ? "LISTENING" : "AWAITING CONNECTION"}</p></div></div>
+          <div className="channel-title"><div className="channel-icon">{displayRoom ? <Hash size={18} /> : <Radio size={18} />}</div><div><h1>{displayRoom ? formatRoomName(displayRoom) : "Global channel"}</h1><p>{activeRoom ? "ROOM TRANSMISSION" : sendToRoom ? "ROOM SEND ONLY" : "OPEN TRANSMISSION"}<span className="title-separator">/</span>{connected ? "LISTENING" : "AWAITING CONNECTION"}</p></div></div>
           <div className="topbar-right"><span className="signal-label"><Activity size={14} /> {connected ? "SIGNAL READY" : "NO SIGNAL"}</span><span className="topbar-divider" /><span className="protocol-label">OSC <b>1.0</b></span></div>
         </header>
 
@@ -366,7 +470,7 @@ export default function App() {
 
         <footer className="composer-wrap">
           <form className="composer" onSubmit={sendMessage}>
-            <div className="composer-leading"><span className="composer-dot" />{activeRoom ? <span># {activeRoom}</span> : <><select aria-label="Message destination" value={sendToRoom ? "room" : "global"} onChange={(event) => setSendToRoom(event.target.value === "room")} disabled={!connected}><option value="global">GLOBAL</option><option value="room">ROOM</option></select>{sendToRoom && <input className="target-room-input" aria-label="Room message destination" placeholder="room name" value={sendRoom} onChange={(event) => setSendRoom(event.target.value)} maxLength={64} disabled={!connected} />}</>}</div>
+            <div className="composer-leading"><span className="composer-dot" />{activeRoom ? <span>#{activeRoom} · {roomRole(activeRoom) ?? "Room"}</span> : <><select aria-label="Message destination" value={sendToRoom ? "room" : "global"} onChange={(event) => setSendToRoom(event.target.value === "room")} disabled={!connected}><option value="global">GLOBAL</option><option value="room">ROOM</option></select>{sendToRoom && <input className="target-room-input" aria-label="Room message destination" placeholder="room name" value={sendRoom} onChange={(event) => setSendRoom(event.target.value)} maxLength={64} disabled={!connected} />}</>}</div>
             <textarea value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={submitOnEnter} placeholder={connected ? "Transmit a message…" : "Connect to transmit"} maxLength={2048} rows={1} disabled={!connected} aria-label="Message" />
             <button type="submit" className="send-button" aria-label="Send message" title="Send message" disabled={!connected || !messageDraft.trim() || sending}><Send size={17} /></button>
           </form>
@@ -375,7 +479,7 @@ export default function App() {
       </section>
 
       <aside className="details-panel">
-        <div className="details-header"><div className="section-label">CHANNEL DETAILS</div><div className="details-channel"><div className="details-channel-icon">{displayRoom ? <Hash size={16} /> : <Radio size={16} />}</div><div><strong>{displayRoom || "Global"}</strong><span>{activeRoom ? "ROOM" : sendToRoom ? "DIRECT TARGET" : "MULTICAST"}</span></div></div></div>
+          <div className="details-header"><div className="section-label">CHANNEL DETAILS</div><div className="details-channel"><div className="details-channel-icon">{displayRoom ? <Hash size={16} /> : <Radio size={16} />}</div><div><strong>{displayRoom ? formatRoomName(displayRoom) : "Global"}</strong><span>{activeRoom ? "ROOM" : sendToRoom ? "DIRECT TARGET" : "MULTICAST"}</span></div></div></div>
         <div className="roster-section"><div className="roster-heading"><span>ON CHANNEL</span><span className="roster-count">{visibleContacts.length + (connected ? 1 : 0)}</span></div>
           {connected && <div className="roster-person"><div className="roster-avatar local">{identity.clientName.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{identity.clientName || "Unnamed station"}</strong><span>YOU · {APPLICATION_NAME}</span></div><span className="roster-presence" /></div>}
           {visibleContacts.map((contact) => <div className="roster-person" key={contact.id}><div className="roster-avatar">{contact.name.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{contact.name}</strong><span>{contact.application}</span></div><span className="roster-presence" /></div>)}

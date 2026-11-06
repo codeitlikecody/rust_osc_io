@@ -66,6 +66,8 @@ textarea:focus-visible {
 .sidebar {
     border-right: 1px solid var(--line);
     padding: 25px 16px 15px;
+    overflow-y: auto;
+    scrollbar-color: #3a453d transparent;
 }
 
 .brand-lockup {
@@ -245,6 +247,18 @@ textarea:focus-visible {
     border-color: #303c2c;
 }
 
+.channel-row-button {
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    cursor: pointer;
+}
+
+.channel-row-button:hover:not(.selected) {
+    color: #d7dfd8;
+    background: #171d19;
+}
+
 .channel-tag {
     margin-left: auto;
     color: #788378;
@@ -252,7 +266,34 @@ textarea:focus-visible {
 }
 
 .room-active {
+    min-height: 42px;
+    height: auto;
     margin-top: 4px;
+}
+
+.active-room-copy {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.active-room-copy strong,
+.active-room-copy small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.active-room-copy strong {
+    color: inherit;
+    font-size: 11px;
+    font-weight: 500;
+}
+
+.active-room-copy small {
+    color: #8d9991;
+    font-size: 9px;
 }
 
 .room-active button {
@@ -305,6 +346,7 @@ textarea:focus-visible {
     outline: 0;
     font-size: 11px;
 }
+
 .application-value {
     display: flex;
     align-items: center;
@@ -340,10 +382,84 @@ textarea:focus-visible {
     cursor: not-allowed;
 }
 
+.recommended-rooms {
+    margin: 19px 4px 0;
+}
+
+.recommended-heading {
+    margin-bottom: 8px;
+    color: #647168;
+    font: 9px var(--mono);
+}
+
+.room-suggestion-section + .room-suggestion-section {
+    margin-top: 15px;
+}
+
+.recommended-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 4px;
+}
+
+.recommended-room {
+    display: flex;
+    min-width: 0;
+    height: 35px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+    padding: 0 7px;
+    text-align: left;
+    background: #171d19;
+    border: 1px solid #29312c;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.recommended-room:hover:not(:disabled),
+.recommended-room.selected {
+    background: #202a20;
+    border-color: #536345;
+}
+
+.recommended-room:disabled {
+    cursor: not-allowed;
+    opacity: .58;
+}
+
+.recommended-room-name,
+.recommended-room-role {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.recommended-room-name {
+    color: #cad3ca;
+    font: 9px var(--mono);
+}
+
+.recommended-room.selected .recommended-room-name {
+    color: var(--green);
+}
+
+.recommended-room-role {
+    color: #748077;
+    font-size: 8px;
+}
+
+.no-room-matches {
+    padding: 8px 0;
+    color: #78857c;
+    font-size: 10px;
+}
+
 .sidebar-bottom {
     margin-top: auto;
     padding: 14px 5px 2px;
     border-top: 1px solid var(--line-soft);
+    flex-shrink: 0;
 }
 
 .network-status {
@@ -415,10 +531,14 @@ textarea:focus-visible {
 }
 
 .channel-title h1 {
+    max-width: 100%;
+    overflow: hidden;
     margin: 0;
     color: var(--text);
     font-size: 15px;
     font-weight: 500;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .channel-title p {

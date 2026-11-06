@@ -1,0 +1,365 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import {
+  Activity,
+  ArrowDownLeft,
+  ArrowUpRight,
+  AudioLines,
+  DoorOpen,
+  Hash,
+  MessageSquareText,
+  Radio,
+  RadioTower,
+  Send,
+  UsersRound,
+  X,
+} from "lucide-react";
+import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
+
+type WorkerEvent =
+  | { kind: "message_sent"; bytes: number }
+  | { kind: "message_received"; sender: string; address: string; args: string[] }
+  | { kind: "error"; message: string }
+  | { kind: "stopped" }
+  | { kind: "dropped_events"; total: number };
+
+type ChatMessage = {
+  id: string;
+  senderId: string;
+  text: string;
+  room: string | null;
+  receivedAt: number;
+};
+
+type Contact = { id: string; name: string; application: string };
+
+type SavedIdentity = {
+  clientName: string;
+  applicationName: string;
+  clientUuid: string;
+};
+
+const IDENTITY_KEY = "oscmessenger.identity.v1";
+const GLOBAL_PRESENCE_QUERY_ROOM = "__OSCMESSENGER_GLOBAL_PRESENCE__";
+const desktopBridgeAvailable = "__TAURI_INTERNALS__" in window;
+
+function newUuid() {
+  return crypto.randomUUID().toUpperCase();
+}
+
+function loadIdentity(): SavedIdentity {
+  try {
+    const saved = localStorage.getItem(IDENTITY_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved) as Partial<SavedIdentity>;
+      return {
+        clientName: parsed.clientName || "Stage client",
+        applicationName: parsed.applicationName || "OSCMessenger",
+        clientUuid: parsed.clientUuid || newUuid(),
+      };
+    }
+  } catch {
+    localStorage.removeItem(IDENTITY_KEY);
+  }
+  return { clientName: "Stage client", applicationName: "OSCMessenger", clientUuid: newUuid() };
+}
+
+function roomFromAddress(address: string) {
+  const prefix = "/messenger/me/room/";
+  const suffix = "/say";
+  if (!address.startsWith(prefix) || !address.endsWith(suffix)) return null;
+  return address.slice(prefix.length, -suffix.length);
+}
+
+function formatTime(timestamp: number) {
+  return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(timestamp);
+}
+
+export default function App() {
+  const [identity, setIdentity] = useState(loadIdentity);
+  const [connected, setConnected] = useState(false);
+  const [clientUuid, setClientUuid] = useState(identity.clientUuid);
+  const [activeRoom, setActiveRoom] = useState<string | null>(null);
+  const [sendToRoom, setSendToRoom] = useState(false);
+  const [sendRoom, setSendRoom] = useState("");
+  const [roomDraft, setRoomDraft] = useState("");
+  const [messageDraft, setMessageDraft] = useState("");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [notice, setNotice] = useState("");
+  const [droppedEvents, setDroppedEvents] = useState(0);
+  const [sending, setSending] = useState(false);
+  const transcriptRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    localStorage.setItem(IDENTITY_KEY, JSON.stringify(identity));
+  }, [identity]);
+
+  useEffect(() => {
+    if (!desktopBridgeAvailable) return;
+    let unlisten: (() => void) | undefined;
+    let active = true;
+    void listen<WorkerEvent>("worker-event", ({ payload }) => {
+      if (!active) return;
+      if (payload.kind === "stopped") {
+        setConnected(false);
+        setActiveRoom(null);
+        setContacts([]);
+        return;
+      }
+      if (payload.kind === "error") {
+        setNotice(payload.message);
+        return;
+      }
+      if (payload.kind === "dropped_events") {
+        setDroppedEvents(payload.total);
+        return;
+      }
+      if (payload.kind !== "message_received") return;
+
+      const { address, args } = payload;
+      const room = roomFromAddress(address);
+      if ((address === "/messenger/me/say" || room !== null) && args.length >= 3) {
+        const [id, senderId, text] = args;
+        setMessages((current) => current.some((message) => message.id === id)
+          ? current
+          : [...current, { id, senderId, text, room, receivedAt: Date.now() }]);
+        return;
+      }
+
+      const globalListening = address === "/messenger/me/listening";
+      const roomListeningPrefix = "/messenger/me/listening/room/";
+      const inCurrentRoom = activeRoom && address === `${roomListeningPrefix}${activeRoom}`;
+      if ((globalListening || inCurrentRoom) && args.length >= 3) {
+        const [id, name, application] = args;
+        if (id !== clientUuid) {
+          setContacts((current) => current.some((contact) => contact.id === id)
+            ? current.map((contact) => contact.id === id ? { ...contact, name, application } : contact)
+            : [...current, { id, name, application }]);
+        }
+      }
+    }).then((stop) => {
+      if (active) unlisten = stop;
+      else stop();
+    }).catch((error: unknown) => setNotice(String(error)));
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [activeRoom, clientUuid]);
+
+  useEffect(() => {
+    transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, activeRoom]);
+
+  const displayRoom = activeRoom ?? (sendToRoom ? sendRoom.trim() || null : null);
+  const visibleMessages = messages.filter((message) => message.room === displayRoom);
+  const visibleContacts = contacts;
+
+  function updateIdentity(field: "clientName" | "applicationName", value: string) {
+    setIdentity((current) => ({ ...current, [field]: value }));
+  }
+
+  async function connect() {
+    if (!desktopBridgeAvailable) return;
+    if (!identity.clientName.trim() || !identity.applicationName.trim()) {
+      setNotice("Add a client name and application name first.");
+      return;
+    }
+    try {
+      const result = await invoke<{ client_uuid: string }>("connect", {
+        clientName: identity.clientName.trim(),
+        applicationName: identity.applicationName.trim(),
+        clientUuid: identity.clientUuid,
+      });
+      setClientUuid(result.client_uuid);
+      setIdentity((current) => ({ ...current, clientUuid: result.client_uuid }));
+      setConnected(true);
+      await invoke("query_listening", { roomName: GLOBAL_PRESENCE_QUERY_ROOM, withinRoom: false });
+      setNotice("");
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
+  async function disconnect() {
+    try {
+      await invoke("disconnect");
+      setConnected(false);
+      setActiveRoom(null);
+      setContacts([]);
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
+  async function enterRoom(event: FormEvent) {
+    event.preventDefault();
+    const room = roomDraft.trim();
+    if (!room || room.includes("/")) {
+      setNotice("Room names cannot be empty or contain a slash.");
+      return;
+    }
+    if (!connected) {
+      setNotice("Connect before entering a room.");
+      return;
+    }
+    try {
+      if (activeRoom && activeRoom !== room) {
+        await invoke("exit_room", { roomName: activeRoom });
+      }
+      await invoke("enter_room", { roomName: room });
+      setActiveRoom(room);
+      setRoomDraft("");
+      setContacts([]);
+      await invoke("query_listening", { roomName: room, withinRoom: true });
+      setNotice("");
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
+  async function leaveRoom() {
+    if (!activeRoom) return;
+    try {
+      await invoke("exit_room", { roomName: activeRoom });
+      setActiveRoom(null);
+      setContacts([]);
+      await invoke("query_listening", { roomName: GLOBAL_PRESENCE_QUERY_ROOM, withinRoom: false });
+      setNotice("");
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
+  async function sendMessage(event: FormEvent) {
+    event.preventDefault();
+    const text = messageDraft.trim();
+    if (!text || !connected || sending) return;
+    const targetRoom = activeRoom ?? (sendToRoom ? sendRoom.trim() : null);
+    if (sendToRoom && (!targetRoom || targetRoom.includes("/"))) {
+      setNotice("Enter a room name without a slash.");
+      return;
+    }
+    const id = newUuid();
+    setSending(true);
+    try {
+      await invoke("send_message", { messageUuid: id, text, roomName: targetRoom });
+      setMessages((current) => current.some((message) => message.id === id)
+        ? current
+        : [...current, { id, senderId: clientUuid, text, room: targetRoom, receivedAt: Date.now() }]);
+      setMessageDraft("");
+      setNotice("");
+    } catch (error) {
+      setNotice(String(error));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function submitOnEnter(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      event.currentTarget.form?.requestSubmit();
+    }
+  }
+
+  return (
+    <main className="app-shell">
+      <aside className="sidebar">
+        <div className="brand-lockup">
+          <div className="brand-mark"><AudioLines size={21} strokeWidth={2.2} /></div>
+          <div><span className="brand-name">OSC<span>Messenger</span></span><span className="brand-edition">STAGE COMMS / 01</span></div>
+        </div>
+
+        <div className="connection-block">
+          <div className="section-label">YOUR STATION</div>
+          <label className="field-label" htmlFor="client-name">Callsign</label>
+          <input id="client-name" value={identity.clientName} maxLength={48} onChange={(event) => updateIdentity("clientName", event.target.value)} disabled={connected} />
+          <label className="field-label" htmlFor="application-name">Application</label>
+          <input id="application-name" value={identity.applicationName} maxLength={48} onChange={(event) => updateIdentity("applicationName", event.target.value)} disabled={connected} />
+          <button className={`connection-button ${connected ? "is-connected" : ""}`} onClick={connected ? disconnect : connect} disabled={!desktopBridgeAvailable}>
+            <span className="connection-indicator" />
+            {connected ? "Disconnect" : "Connect to OSC"}
+            {connected ? <X size={15} /> : <RadioTower size={15} />}
+          </button>
+          <div className="connection-meta"><span>{connected ? "MULTICAST LINK ACTIVE" : "LINK STANDBY"}</span><span className="mono">239.254.0.1 : 3090</span></div>
+        </div>
+
+        <div className="channels-block">
+          <div className="section-heading"><span className="section-label">CHANNEL</span><span className="live-dot" /></div>
+          <div className={`channel-row ${activeRoom ? "" : "selected"}`}>
+            <MessageSquareText size={16} /><span>Global</span><span className="channel-tag">ALL</span>
+          </div>
+          {activeRoom && <div className="channel-row selected room-active"><Hash size={16} /><span>{activeRoom}</span><button aria-label="Leave room" title="Leave room" onClick={leaveRoom}><DoorOpen size={15} /></button></div>}
+          <form className="room-form" onSubmit={enterRoom}>
+            <label htmlFor="room-name">ENTER A ROOM</label>
+            <div className="room-input-wrap"><Hash size={15} /><input id="room-name" value={roomDraft} onChange={(event) => setRoomDraft(event.target.value)} placeholder="room name" maxLength={64} disabled={!connected} /><button title="Enter room" aria-label="Enter room" disabled={!connected || !roomDraft.trim()}><ArrowUpRight size={16} /></button></div>
+          </form>
+        </div>
+
+        <div className="sidebar-bottom">
+          <div className="network-status"><span className={connected ? "status-led active" : "status-led"} /><span>{connected ? "OSC NETWORK" : "OFFLINE"}</span><span className="mono">UDP</span></div>
+          <div className="client-id"><span>CLIENT UUID</span><code>{clientUuid.slice(0, 8)}…{clientUuid.slice(-4)}</code></div>
+        </div>
+      </aside>
+
+      <section className="main-panel">
+        <header className="topbar">
+          <div className="channel-title"><div className="channel-icon">{displayRoom ? <Hash size={18} /> : <Radio size={18} />}</div><div><h1>{displayRoom || "Global channel"}</h1><p>{activeRoom ? "ROOM TRANSMISSION" : sendToRoom ? "ROOM SEND ONLY" : "OPEN TRANSMISSION"}<span className="title-separator">/</span>{connected ? "LISTENING" : "AWAITING CONNECTION"}</p></div></div>
+          <div className="topbar-right"><span className="signal-label"><Activity size={14} /> {connected ? "SIGNAL READY" : "NO SIGNAL"}</span><span className="topbar-divider" /><span className="protocol-label">OSC <b>1.0</b></span></div>
+        </header>
+
+        {!desktopBridgeAvailable && <div className="browser-notice">Open OSCMessenger as a desktop app to connect to the multicast network.</div>}
+        {notice && <div className="notice" role="status"><span>{notice}</span><button title="Dismiss" aria-label="Dismiss" onClick={() => setNotice("")}><X size={15} /></button></div>}
+        {droppedEvents > 0 && <div className="drop-warning"><ArrowDownLeft size={15} /> {droppedEvents} network event{droppedEvents === 1 ? "" : "s"} dropped while the queue was full.</div>}
+
+        <div className="transcript" ref={transcriptRef}>
+          {visibleMessages.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-mark"><AudioLines size={27} /></div>
+              <div className="empty-kicker">{connected ? "CHANNEL OPEN" : "STANDING BY"}</div>
+              <h2>{connected ? "Quiet on comms." : "Ready when you are."}</h2>
+              <p>{connected ? "Messages on this channel will appear here." : "Connect to the OSC network to start sending and receiving."}</p>
+              <div className="empty-rule"><span /><span /><span /></div>
+            </div>
+          ) : (
+            <div className="message-list">
+              <div className="day-marker"><span /> LIVE TRANSMISSION <span /></div>
+              {visibleMessages.map((message, index) => {
+                const own = message.senderId === clientUuid;
+                const contact = contacts.find((item) => item.id === message.senderId);
+                return <article className={`message ${own ? "own-message" : ""}`} key={message.id} style={{ animationDelay: `${Math.min(index, 8) * 35}ms` }}>
+                  <div className={`avatar ${own ? "own-avatar" : ""}`}>{(own ? identity.clientName : contact?.name || message.senderId).slice(0, 1).toUpperCase()}</div>
+                  <div className="message-content"><div className="message-meta"><strong>{own ? `${identity.clientName} (you)` : contact?.name || message.senderId.slice(0, 8)}</strong><span>{formatTime(message.receivedAt)}</span>{!own && contact && <span className="app-tag">{contact.application}</span>}</div><p>{message.text}</p></div>
+                  <span className="message-kind">{own ? "OUT" : "IN"}</span>
+                </article>;
+              })}
+            </div>
+          )}
+        </div>
+
+        <footer className="composer-wrap">
+          <form className="composer" onSubmit={sendMessage}>
+            <div className="composer-leading"><span className="composer-dot" />{activeRoom ? <span># {activeRoom}</span> : <><select aria-label="Message destination" value={sendToRoom ? "room" : "global"} onChange={(event) => setSendToRoom(event.target.value === "room")} disabled={!connected}><option value="global">GLOBAL</option><option value="room">ROOM</option></select>{sendToRoom && <input className="target-room-input" aria-label="Room message destination" placeholder="room name" value={sendRoom} onChange={(event) => setSendRoom(event.target.value)} maxLength={64} disabled={!connected} />}</>}</div>
+            <textarea value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={submitOnEnter} placeholder={connected ? "Transmit a message…" : "Connect to transmit"} maxLength={2048} rows={1} disabled={!connected} aria-label="Message" />
+            <button type="submit" className="send-button" aria-label="Send message" title="Send message" disabled={!connected || !messageDraft.trim() || sending}><Send size={17} /></button>
+          </form>
+          <div className="composer-hint"><span>RETURN TO SEND <kbd>↵</kbd></span><span>SHIFT + RETURN FOR NEW LINE</span>{sendToRoom && !activeRoom && <span className="direct-send-note">NOT JOINED</span>}<span className="char-count">{messageDraft.length}/2048</span></div>
+        </footer>
+      </section>
+
+      <aside className="details-panel">
+        <div className="details-header"><div className="section-label">CHANNEL DETAILS</div><div className="details-channel"><div className="details-channel-icon">{displayRoom ? <Hash size={16} /> : <Radio size={16} />}</div><div><strong>{displayRoom || "Global"}</strong><span>{activeRoom ? "ROOM" : sendToRoom ? "DIRECT TARGET" : "MULTICAST"}</span></div></div></div>
+        <div className="roster-section"><div className="roster-heading"><span>ON CHANNEL</span><span className="roster-count">{visibleContacts.length + (connected ? 1 : 0)}</span></div>
+          {connected && <div className="roster-person"><div className="roster-avatar local">{identity.clientName.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{identity.clientName || "Unnamed station"}</strong><span>YOU · {identity.applicationName}</span></div><span className="roster-presence" /></div>}
+          {visibleContacts.map((contact) => <div className="roster-person" key={contact.id}><div className="roster-avatar">{contact.name.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{contact.name}</strong><span>{contact.application}</span></div><span className="roster-presence" /></div>)}
+          {!connected && <div className="roster-empty"><UsersRound size={17} /><span>No stations connected</span></div>}
+          {connected && visibleContacts.length === 0 && <div className="roster-empty"><UsersRound size={17} /><span>Only you, for now</span></div>}
+        </div>
+        <div className="transport-section"><div className="section-label">TRANSPORT</div><div className="transport-row"><span>Protocol</span><strong>OSC over UDP</strong></div><div className="transport-row"><span>Multicast group</span><strong className="mono">239.254.0.1</strong></div><div className="transport-row"><span>Port</span><strong className="mono">3090</strong></div><div className="transport-row"><span>Client ID</span><strong className="mono">{clientUuid.slice(0, 8)}</strong></div></div>
+        <div className="details-footer"><DoorOpen size={14} /><span>{sendToRoom && !activeRoom ? "DIRECT ROOM SEND DOES NOT JOIN THE ROOM" : "ROOM MEMBERSHIP IS LOCAL TO THIS CLIENT"}</span></div>
+      </aside>
+    </main>
+  );
+}

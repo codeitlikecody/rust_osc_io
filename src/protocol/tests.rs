@@ -420,6 +420,31 @@ fn message_try_from_room_enter_bad_args() {
     ));
 }
 
+#[test]
+fn message_try_from_room_say_bad_args() {
+    let wrong_count = packet(
+        "/messenger/me/room/lobby/say",
+        string_args(&["message_uuid", "client_uuid"]),
+    );
+    assert!(matches!(
+        Message::try_from(&wrong_count),
+        Err(MessengerProtocolError::InvalidArgumentCount(_))
+    ));
+
+    let wrong_type = packet(
+        "/messenger/me/room/lobby/say",
+        vec![
+            OscType::String("message_uuid".to_string()),
+            OscType::Int(42),
+            OscType::String("hello".to_string()),
+        ],
+    );
+    assert!(matches!(
+        Message::try_from(&wrong_type),
+        Err(MessengerProtocolError::ArgumentTypeMismatch(_))
+    ));
+}
+
 /// Test Say::new for unique message UUIDs
 #[test]
 fn say_new_unique_message_uuids() {
@@ -467,20 +492,44 @@ fn messenger_client_accessors() {
 
 /// Generates an arbitrary MessengerClient for property testing.
 fn arb_client() -> impl Strategy<Value = MessengerClient> {
-    (any::<String>(), any::<String>(), any::<String>()).prop_map(|(u, n, a)| MessengerClient {
-        client_uuid: u,
-        client_name: n,
-        application_name: a,
-    })
+    (arb_osc_string(), arb_osc_string(), arb_osc_string()).prop_map(
+        |(client_uuid, client_name, application_name)| MessengerClient {
+            client_uuid,
+            client_name,
+            application_name,
+        },
+    )
 }
 
 /// Generates an arbitrary Say for property testing.
 fn arb_say() -> impl Strategy<Value = Say> {
-    (any::<String>(), any::<String>(), any::<String>()).prop_map(|(m, c, t)| Say {
-        message_uuid: m,
-        client_uuid: c,
-        message: t,
-    })
+    (arb_osc_string(), arb_osc_string(), arb_osc_string()).prop_map(
+        |(message_uuid, client_uuid, message)| Say {
+            message_uuid,
+            client_uuid,
+            message,
+        },
+    )
+}
+
+fn arb_osc_string() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        any::<char>().prop_filter("OSC strings cannot contain NUL", |character| {
+            *character != '\0'
+        }),
+        0..32,
+    )
+    .prop_map(|characters| characters.into_iter().collect())
+}
+
+fn arb_room_name() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        any::<char>().prop_filter("room names cannot contain path separators", |character| {
+            *character != '\0' && *character != '/'
+        }),
+        1..32,
+    )
+    .prop_map(|characters| characters.into_iter().collect())
 }
 
 /// Generates an arbitrary Message for property testing.
@@ -489,6 +538,19 @@ fn arb_message() -> impl Strategy<Value = Message> {
         arb_client().prop_map(|c| Message::Me(Me::Introduce(c))),
         arb_client().prop_map(|c| Message::Me(Me::Welcome(c))),
         arb_say().prop_map(|s| Message::Me(Me::Say(s))),
+        (arb_room_name(), arb_say())
+            .prop_map(|(room, say)| { Message::Me(Me::SayInRoom(RoomSay::new(room, say))) }),
+        arb_client().prop_map(|c| Message::Me(Me::Listening(c))),
+        (arb_room_name(), arb_client()).prop_map(|(room, client)| {
+            Message::Me(Me::ListeningInRoom(RoomListening::new(room, client)))
+        }),
+        (arb_room_name(), arb_client()).prop_map(|(room, client)| {
+            Message::Me(Me::EnterRoom(RoomEnter::new(room, client)))
+        }),
+        (arb_room_name(), arb_client())
+            .prop_map(|(room, client)| { Message::Me(Me::ExitRoom(RoomExit::new(room, client))) }),
+        arb_room_name().prop_map(|room| Message::Who(Who::Listening(room))),
+        arb_room_name().prop_map(|room| Message::Who(Who::ListeningInRoom(room))),
     ]
 }
 

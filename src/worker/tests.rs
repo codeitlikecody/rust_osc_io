@@ -73,6 +73,37 @@ fn replies_to_in_room_query_only_when_in_that_room() {
     assert_eq!(response_to(&query, &local_client, None), None);
 }
 
+#[test]
+fn entering_and_exiting_updates_current_room_correctly() {
+    let local_client = client("local");
+    let mut current_room = None;
+
+    update_current_room(&mut current_room, "lobby", true);
+    assert_eq!(current_room.as_deref(), Some("lobby"));
+
+    update_current_room(&mut current_room, "other", false);
+    assert_eq!(current_room.as_deref(), Some("lobby"));
+    assert!(
+        response_to(
+            &Message::Who(Who::ListeningInRoom("lobby".to_string())),
+            &local_client,
+            current_room.as_deref()
+        )
+        .is_some()
+    );
+
+    update_current_room(&mut current_room, "lobby", false);
+    assert_eq!(current_room, None);
+    assert!(
+        response_to(
+            &Message::Who(Who::Listening("lobby".to_string())),
+            &local_client,
+            current_room.as_deref()
+        )
+        .is_some()
+    );
+}
+
 fn received_welcome_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -> bool {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -98,9 +129,18 @@ fn received_welcome_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -
     }
 }
 
-fn received_listening_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -> bool {
+fn received_listening_from_both(
+    handle: &OscWorkerHandle,
+    first_client_uuid: &str,
+    second_client_uuid: &str,
+) -> bool {
     let deadline = Instant::now() + Duration::from_secs(3);
+    let mut received_first = false;
+    let mut received_second = false;
     loop {
+        if received_first && received_second {
+            return true;
+        }
         let timeout = deadline.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
             return false;
@@ -108,9 +148,14 @@ fn received_listening_from(handle: &OscWorkerHandle, expected_client_uuid: &str)
 
         match handle.event_receiver().recv_timeout(timeout) {
             Ok(OscWorkerEvent::MessageReceived(_, Message::Me(Me::Listening(client))))
-                if client.client_uuid() == expected_client_uuid =>
+                if client.client_uuid() == first_client_uuid =>
             {
-                return true;
+                received_first = true;
+            }
+            Ok(OscWorkerEvent::MessageReceived(_, Message::Me(Me::Listening(client))))
+                if client.client_uuid() == second_client_uuid =>
+            {
+                received_second = true;
             }
             Ok(OscWorkerEvent::Error(error)) => {
                 eprintln!("wire test worker error: {error:?}");
@@ -235,8 +280,9 @@ fn two_workers_exchange_welcomes_over_multicast() {
     first
         .query_listening_outside_room("lobby".to_string())
         .unwrap();
-    let first_received_listening = received_listening_from(&first, &second_uuid);
-    let second_received_listening = received_listening_from(&second, &first_uuid);
+    let first_received_listening = received_listening_from_both(&first, &first_uuid, &second_uuid);
+    let second_received_listening =
+        received_listening_from_both(&second, &first_uuid, &second_uuid);
     first.enter_room("lobby".to_string()).unwrap();
     assert!(
         wait_for_message_sent(&first),
@@ -250,6 +296,17 @@ fn two_workers_exchange_welcomes_over_multicast() {
         .unwrap();
     let second_received_room_say =
         received_room_say_from(&second, &first_uuid, "lobby", "Hello from room");
+    assert!(
+        wait_for_message_sent(&first),
+        "first client did not send its room message"
+    );
+    first.exit_room("lobby".to_string()).unwrap();
+    let first_exited_room = wait_for_message_sent(&first);
+    second
+        .query_listening_outside_room("lobby".to_string())
+        .unwrap();
+    let outside_replies_after_exit =
+        received_listening_from_both(&first, &first_uuid, &second_uuid);
 
     first.stop_osc_worker().unwrap();
     second.stop_osc_worker().unwrap();
@@ -279,5 +336,10 @@ fn two_workers_exchange_welcomes_over_multicast() {
     assert!(
         second_received_room_say,
         "second client did not receive first client's room message"
+    );
+    assert!(first_exited_room, "first client did not exit lobby");
+    assert!(
+        outside_replies_after_exit,
+        "clients did not reply to outside-room query after first client exited"
     );
 }

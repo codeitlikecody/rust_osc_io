@@ -243,11 +243,7 @@ fn spawn_osc_worker(
                     match send_osc_message(destination, sender_address, message) {
                         Ok(bytes_sent) => {
                             if let Some((room_name, entering)) = room_transition {
-                                if entering {
-                                    current_room = Some(room_name);
-                                } else if current_room.as_deref() == Some(&room_name) {
-                                    current_room = None;
-                                }
+                                update_current_room(&mut current_room, &room_name, entering);
                             }
                             events
                                 .send(OscWorkerEvent::MessageSent(bytes_sent))
@@ -371,6 +367,14 @@ fn response_to(
             ))))
         }
         _ => None,
+    }
+}
+
+fn update_current_room(current_room: &mut Option<String>, room_name: &str, entering: bool) {
+    if entering {
+        *current_room = Some(room_name.to_string());
+    } else if current_room.as_deref() == Some(room_name) {
+        *current_room = None;
     }
 }
 

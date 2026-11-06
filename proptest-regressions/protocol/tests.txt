@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 19d20f11b50b90492c099134c3336178492d3f197165d6ebf59cfad01bfb945f # shrinks to message = Me(Introduce(MessengerClient { client_uuid: "", client_name: "", application_name: "" }))

@@ -3,6 +3,9 @@ use rosc::{OscBundle, OscTime};
 
 use super::*;
 
+const TEST_CLIENT_UUID: &str = "B0BAE0A0-3BBE-4004-888B-F61CA125D0B0";
+const TEST_MESSAGE_UUID: &str = "C0BAE0A0-3BBE-4004-888B-F61CA125D0B0";
+
 /// Helper function to convert a slice of string slices into a vector of OscType::String.
 /// # Arguments
 /// * `v` - A slice of string slices.
@@ -51,8 +54,8 @@ fn assert_wire_format(message: Message, addr: &str, args: &[&str]) {
 /// A sample Say message for testing.
 fn sample_say() -> Say {
     Say {
-        message_uuid: "message_uuid".to_string(),
-        client_uuid: "client_uuid".to_string(),
+        message_uuid: TEST_MESSAGE_UUID.to_string(),
+        client_uuid: TEST_CLIENT_UUID.to_string(),
         message: "Hello, world!".to_string(),
     }
 }
@@ -63,7 +66,7 @@ fn say_wire_format() {
     assert_wire_format(
         Message::Me(Me::Say(sample_say())),
         OSC_ADDRESS_ME_SAY,
-        &["message_uuid", "client_uuid", "Hello, world!"],
+        &[TEST_MESSAGE_UUID, TEST_CLIENT_UUID, "Hello, world!"],
     );
 }
 
@@ -72,7 +75,7 @@ fn farewell_wire_format() {
     assert_wire_format(
         Message::Me(Me::Farewell(sample_client())),
         "/messenger/me/farewell",
-        &["client_uuid", "Alice", "Protocol Test Client"],
+        &[TEST_CLIENT_UUID, "Alice", "Protocol Test Client"],
     );
 }
 
@@ -84,7 +87,7 @@ fn room_say_wire_format() {
             sample_say(),
         ))),
         "/messenger/me/room/lobby/say",
-        &["message_uuid", "client_uuid", "Hello, world!"],
+        &[TEST_MESSAGE_UUID, TEST_CLIENT_UUID, "Hello, world!"],
     );
 }
 
@@ -100,6 +103,52 @@ fn room_say_rejects_empty_or_slash_containing_names() {
             Err(MessengerProtocolError::InvalidRoomName(_))
         ));
     }
+}
+
+#[test]
+fn outbound_messages_reject_invalid_uuids() {
+    let invalid_client = Message::Me(Me::Introduce(MessengerClient::new_with_uuid(
+        "not-a-uuid".to_string(),
+        "Alice".to_string(),
+        "App".to_string(),
+    )));
+    assert!(matches!(
+        invalid_client.to_osc(),
+        Err(MessengerProtocolError::InvalidUuid(_))
+    ));
+
+    let invalid_message = Message::Me(Me::Say(Say::new_with_uuid(
+        "not-a-uuid".to_string(),
+        TEST_CLIENT_UUID.to_string(),
+        "hello".to_string(),
+    )));
+    assert!(matches!(
+        invalid_message.to_osc(),
+        Err(MessengerProtocolError::InvalidUuid(_))
+    ));
+}
+
+#[test]
+fn incoming_messages_preserve_unrecognized_uuid_strings() {
+    let client_packet = packet(
+        "/messenger/me/introduce",
+        string_args(&["peer-id", "Alice", "App"]),
+    );
+    let client_message = Message::try_from(&client_packet).unwrap();
+    assert!(matches!(
+        client_message,
+        Message::Me(Me::Introduce(client)) if client.client_uuid() == "peer-id"
+    ));
+
+    let say_packet = packet(
+        "/messenger/me/say",
+        string_args(&["message-id", "peer-id", "hello"]),
+    );
+    let say_message = Message::try_from(&say_packet).unwrap();
+    assert!(matches!(
+        say_message,
+        Message::Me(Me::Say(say)) if say.to_args() == string_args(&["message-id", "peer-id", "hello"])
+    ));
 }
 
 /// Tests Say::from_args and to_args methods for round-trip conversion.
@@ -168,7 +217,7 @@ fn say_from_args_error_type() {
 /// A sample MessengerClient for testing.
 fn sample_client() -> MessengerClient {
     MessengerClient {
-        client_uuid: "client_uuid".to_string(),
+        client_uuid: TEST_CLIENT_UUID.to_string(),
         client_name: "Alice".to_string(),
         application_name: "Protocol Test Client".to_string(),
     }
@@ -178,7 +227,7 @@ fn sample_client() -> MessengerClient {
 //TODO: Fix this test. A zero byte seems to cause issues for rust as well as osc. I need fto handle it better.
 #[test]
 fn null_bytes_in_strings() {
-    let args = string_args(&["message_uuid", "client_uuid", "Hello, \0world!"]);
+    let args = string_args(&[TEST_MESSAGE_UUID, TEST_CLIENT_UUID, "Hello, \0world!"]);
     let say = Say::from_args(&args).unwrap();
     let err = Message::Me(Me::Say(say)).to_osc().unwrap_err();
     assert!(matches!(err, MessengerProtocolError::NullByteInString(_)));
@@ -190,7 +239,7 @@ fn introduce_wire_format() {
     assert_wire_format(
         Message::Me(Me::Introduce(sample_client())),
         OSC_ADDRESS_ME_INTRODUCE,
-        &["client_uuid", "Alice", "Protocol Test Client"],
+        &[TEST_CLIENT_UUID, "Alice", "Protocol Test Client"],
     );
 }
 
@@ -200,7 +249,7 @@ fn welcome_wire_format() {
     assert_wire_format(
         Message::Me(Me::Welcome(sample_client())),
         OSC_ADDRESS_ME_WELCOME,
-        &["client_uuid", "Alice", "Protocol Test Client"],
+        &[TEST_CLIENT_UUID, "Alice", "Protocol Test Client"],
     );
 }
 
@@ -209,7 +258,7 @@ fn listening_response_wire_format() {
     assert_wire_format(
         Message::Me(Me::Listening(sample_client())),
         "/messenger/me/listening",
-        &["client_uuid", "Alice", "Protocol Test Client"],
+        &[TEST_CLIENT_UUID, "Alice", "Protocol Test Client"],
     );
 }
 
@@ -230,7 +279,7 @@ fn in_room_listening_response_wire_format() {
             sample_client(),
         ))),
         "/messenger/me/listening/room/lobby",
-        &["client_uuid", "Alice", "Protocol Test Client"],
+        &[TEST_CLIENT_UUID, "Alice", "Protocol Test Client"],
     );
 }
 
@@ -243,7 +292,7 @@ fn room_enter_wire_format() {
             sample_client(),
         ))),
         "/messenger/me/room/lobby one/enter",
-        &["client_uuid", "Alice", "Protocol Test Client"],
+        &[TEST_CLIENT_UUID, "Alice", "Protocol Test Client"],
     );
 }
 
@@ -255,7 +304,7 @@ fn room_exit_wire_format() {
             sample_client(),
         ))),
         "/messenger/me/room/lobby one/exit",
-        &["client_uuid", "Alice", "Protocol Test Client"],
+        &[TEST_CLIENT_UUID, "Alice", "Protocol Test Client"],
     );
 }
 
@@ -539,7 +588,7 @@ fn messenger_client_new_storing_inputs() {
 #[test]
 fn messenger_client_accessors() {
     let client = sample_client();
-    assert_eq!(client.client_uuid(), "client_uuid");
+    assert_eq!(client.client_uuid(), TEST_CLIENT_UUID);
     assert_eq!(client.client_name(), "Alice");
     assert_eq!(client.application_name(), "Protocol Test Client");
 }
@@ -550,7 +599,7 @@ fn messenger_client_accessors() {
 
 /// Generates an arbitrary MessengerClient for property testing.
 fn arb_client() -> impl Strategy<Value = MessengerClient> {
-    (arb_osc_string(), arb_osc_string(), arb_osc_string()).prop_map(
+    (arb_uuid(), arb_osc_string(), arb_osc_string()).prop_map(
         |(client_uuid, client_name, application_name)| MessengerClient {
             client_uuid,
             client_name,
@@ -561,13 +610,17 @@ fn arb_client() -> impl Strategy<Value = MessengerClient> {
 
 /// Generates an arbitrary Say for property testing.
 fn arb_say() -> impl Strategy<Value = Say> {
-    (arb_osc_string(), arb_osc_string(), arb_osc_string()).prop_map(
-        |(message_uuid, client_uuid, message)| Say {
+    (arb_uuid(), arb_uuid(), arb_osc_string()).prop_map(|(message_uuid, client_uuid, message)| {
+        Say {
             message_uuid,
             client_uuid,
             message,
-        },
-    )
+        }
+    })
+}
+
+fn arb_uuid() -> impl Strategy<Value = String> {
+    any::<[u8; 16]>().prop_map(|bytes| uuid::Uuid::from_bytes(bytes).to_string())
 }
 
 fn arb_osc_string() -> impl Strategy<Value = String> {

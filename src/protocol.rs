@@ -26,6 +26,7 @@ pub enum MessengerProtocolError {
     BundleNotSupported,
     NullByteInString(String),
     InvalidRoomName(String),
+    InvalidUuid(String),
 }
 impl std::fmt::Display for MessengerProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,6 +41,7 @@ impl std::fmt::Display for MessengerProtocolError {
             ),
             Self::BundleNotSupported => write!(f, "OSC bundles are not supported"),
             Self::InvalidRoomName(name) => write!(f, "Invalid room name: {name}"),
+            Self::InvalidUuid(uuid) => write!(f, "Invalid UUID: {uuid}"),
         }
     }
 }
@@ -147,6 +149,7 @@ impl TryFrom<&Message> for OscPacket {
                 }
             }
         }
+        validate_outbound_uuids(message)?;
         if address.contains('\0') {
             return Err(MessengerProtocolError::NullByteInString(format!(
                 "Null byte found in OSC address: {}",
@@ -311,6 +314,37 @@ fn validate_room_name(room_name: &str) -> Result<(), MessengerProtocolError> {
         ))
     } else {
         Ok(())
+    }
+}
+
+fn validate_outbound_uuids(message: &Message) -> Result<(), MessengerProtocolError> {
+    match message {
+        Message::Me(
+            Me::Introduce(client)
+            | Me::Welcome(client)
+            | Me::Farewell(client)
+            | Me::Listening(client),
+        ) => validate_uuid(&client.client_uuid),
+        Message::Me(Me::ListeningInRoom(listening)) => validate_uuid(&listening.client.client_uuid),
+        Message::Me(Me::EnterRoom(room)) => validate_uuid(&room.client.client_uuid),
+        Message::Me(Me::ExitRoom(room)) => validate_uuid(&room.client.client_uuid),
+        Message::Me(Me::Say(say)) => {
+            validate_uuid(&say.message_uuid)?;
+            validate_uuid(&say.client_uuid)
+        }
+        Message::Me(Me::SayInRoom(room_say)) => {
+            validate_uuid(&room_say.say.message_uuid)?;
+            validate_uuid(&room_say.say.client_uuid)
+        }
+        Message::Who(_) => Ok(()),
+    }
+}
+
+fn validate_uuid(value: &str) -> Result<(), MessengerProtocolError> {
+    if value.len() == 36 && uuid::Uuid::parse_str(value).is_ok() {
+        Ok(())
+    } else {
+        Err(MessengerProtocolError::InvalidUuid(value.to_string()))
     }
 }
 

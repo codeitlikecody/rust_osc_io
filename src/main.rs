@@ -24,13 +24,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let stdin = io::stdin();
 
-    loop {
+    'input: loop {
         // Check for messages from the worker thread. Make sure to check for all messages, since the worker thread may have sent multiple messages since the last time we checked. If we don't check for messages, the worker thread may block when trying to send a message to the main thread, which will cause the worker thread to stop responding.
         while let Ok(message) = check_for_events(&osc_worker_handle) {
             match message {
                 OscWorkerEvent::Stopped => {
                     println!("Worker thread has stopped. Exiting input loop.");
-                    break;
+                    break 'input;
                 }
                 _ => {}
             }

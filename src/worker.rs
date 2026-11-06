@@ -145,6 +145,10 @@ impl OscWorkerHandle {
         ))))
     }
 
+    pub fn query_listening_outside_room(&self, room_name: String) -> Result<(), io::Error> {
+        self.send_osc(Message::Who(crate::protocol::Who::Listening(room_name)))
+    }
+
     /// Sends a message to the worker thread.
     /// Returns an io::Error if the worker thread has already stopped.
     fn send_osc(&self, message: Message) -> Result<(), io::Error> {

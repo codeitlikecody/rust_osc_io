@@ -6,6 +6,7 @@ const OSC_ADDRESS_ME_INTRODUCE: &str = "/messenger/me/introduce";
 const OSC_ADDRESS_ME_WELCOME: &str = "/messenger/me/welcome";
 const OSC_ADDRESS_ME_SAY: &str = "/messenger/me/say";
 const OSC_ADDRESS_WHO: &str = "/messenger/who";
+const OSC_ADDRESS_WHO_LISTENING: &str = "/messenger/who/listening";
 const OSC_ADDRESS_ME_ROOM_PREFIX: &str = "/messenger/me/room/";
 const OSC_ADDRESS_ME_ROOM_ENTER_SUFFIX: &str = "/enter";
 const OSC_ADDRESS_ME_ROOM_EXIT_SUFFIX: &str = "/exit";
@@ -66,7 +67,8 @@ impl Message {
                     room.room_name
                 )),
             },
-            Message::Who(_) => Cow::Borrowed(OSC_ADDRESS_WHO),
+            Message::Who(Who::Todo) => Cow::Borrowed(OSC_ADDRESS_WHO),
+            Message::Who(Who::Listening(_)) => Cow::Borrowed(OSC_ADDRESS_WHO_LISTENING),
         }
     }
 
@@ -80,8 +82,10 @@ impl Message {
                 Me::EnterRoom(room) => room.client.to_args(),
                 Me::ExitRoom(room) => room.client.to_args(),
             },
-            // TODO: Placeholder for Who message arguments.
-            Message::Who(_) => vec![],
+            Message::Who(Who::Todo) => vec![],
+            Message::Who(Who::Listening(room_name)) => {
+                vec![OscType::String(room_name.clone())]
+            }
         }
     }
     /// Converts the message into an OscPacket.
@@ -102,6 +106,9 @@ impl TryFrom<&Message> for OscPacket {
             _ => None,
         };
         if let Some(room_name) = room_name {
+            validate_room_name(room_name)?;
+        }
+        if let Message::Who(Who::Listening(room_name)) = message {
             validate_room_name(room_name)?;
         }
         // Check for null bytes in address or string arguments, as OSC strings are null-terminated and cannot contain null bytes.
@@ -141,47 +148,59 @@ impl TryFrom<&OscPacket> for Message {
     type Error = MessengerProtocolError;
     fn try_from(osc_packet: &OscPacket) -> Result<Self, Self::Error> {
         match osc_packet {
-            OscPacket::Message(osc_message) => {
-                match osc_message.addr.as_str() {
-                    OSC_ADDRESS_ME_INTRODUCE => match MessengerClient::from_args(&osc_message.args)
-                    {
-                        Ok(client) => Ok(Message::Me(Me::Introduce(client))),
-                        Err(err) => Err(err),
-                    },
-                    OSC_ADDRESS_ME_WELCOME => match MessengerClient::from_args(&osc_message.args) {
-                        Ok(client) => Ok(Message::Me(Me::Welcome(client))),
-                        Err(err) => Err(err),
-                    },
-                    OSC_ADDRESS_ME_SAY => match Say::from_args(&osc_message.args) {
-                        Ok(say) => Ok(Message::Me(Me::Say(say))),
-                        Err(err) => Err(err),
-                    },
-                    // TODO: Implement Who message parsing. For now, just return a placeholder.
-                    OSC_ADDRESS_WHO => Err(MessengerProtocolError::NotImplemented(
-                        "Who message parsing not implemented".into(),
-                    )),
-                    _ => match room_action_from_address(&osc_message.addr) {
-                        Some((room_name, entering)) => {
-                            let client = MessengerClient::from_args(&osc_message.args)?;
-                            if entering {
-                                Ok(Message::Me(Me::EnterRoom(RoomEnter::new(
-                                    room_name.to_string(),
-                                    client,
-                                ))))
-                            } else {
-                                Ok(Message::Me(Me::ExitRoom(RoomExit::new(
-                                    room_name.to_string(),
-                                    client,
-                                ))))
-                            }
-                        }
-                        None => Err(MessengerProtocolError::UnknownAddress(format!(
-                            "Unknown OSC address: {}",
-                            osc_message.addr
-                        ))),
-                    },
+            OscPacket::Message(osc_message) => match osc_message.addr.as_str() {
+                OSC_ADDRESS_ME_INTRODUCE => match MessengerClient::from_args(&osc_message.args) {
+                    Ok(client) => Ok(Message::Me(Me::Introduce(client))),
+                    Err(err) => Err(err),
+                },
+                OSC_ADDRESS_ME_WELCOME => match MessengerClient::from_args(&osc_message.args) {
+                    Ok(client) => Ok(Message::Me(Me::Welcome(client))),
+                    Err(err) => Err(err),
+                },
+                OSC_ADDRESS_ME_SAY => match Say::from_args(&osc_message.args) {
+                    Ok(say) => Ok(Message::Me(Me::Say(say))),
+                    Err(err) => Err(err),
+                },
+                OSC_ADDRESS_WHO_LISTENING => {
+                    if osc_message.args.len() != 1 {
+                        return Err(MessengerProtocolError::InvalidArgumentCount(format!(
+                            "Invalid number of arguments for listening query: expected 1, got {}",
+                            osc_message.args.len()
+                        )));
+                    }
+                    if let OscType::String(room_name) = &osc_message.args[0] {
+                        validate_room_name(room_name)?;
+                        Ok(Message::Who(Who::Listening(room_name.clone())))
+                    } else {
+                        Err(MessengerProtocolError::ArgumentTypeMismatch(
+                            "Invalid argument type for listening query".into(),
+                        ))
+                    }
                 }
-            }
+                OSC_ADDRESS_WHO => Err(MessengerProtocolError::NotImplemented(
+                    "Who message parsing not implemented".into(),
+                )),
+                _ => match room_action_from_address(&osc_message.addr) {
+                    Some((room_name, entering)) => {
+                        let client = MessengerClient::from_args(&osc_message.args)?;
+                        if entering {
+                            Ok(Message::Me(Me::EnterRoom(RoomEnter::new(
+                                room_name.to_string(),
+                                client,
+                            ))))
+                        } else {
+                            Ok(Message::Me(Me::ExitRoom(RoomExit::new(
+                                room_name.to_string(),
+                                client,
+                            ))))
+                        }
+                    }
+                    None => Err(MessengerProtocolError::UnknownAddress(format!(
+                        "Unknown OSC address: {}",
+                        osc_message.addr
+                    ))),
+                },
+            },
             OscPacket::Bundle(_) => Err(MessengerProtocolError::BundleNotSupported),
         }
     }
@@ -226,6 +245,7 @@ impl TryFrom<OscPacket> for Message {
 pub enum Who {
     // TODO: Implement the Who message. For now, just a placeholder.
     Todo,
+    Listening(String),
 }
 
 /// This enum represents a message sent by a client to the multicast group.

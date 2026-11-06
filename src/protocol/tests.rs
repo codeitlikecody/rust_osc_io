@@ -284,6 +284,30 @@ fn message_try_from_who() {
     assert!(matches!(err, MessengerProtocolError::NotImplemented(_)));
 }
 
+#[test]
+fn listening_query_wire_format() {
+    assert_wire_format(
+        Message::Who(Who::Listening("lobby".to_string())),
+        "/messenger/who/listening",
+        &["lobby"],
+    );
+}
+
+#[test]
+fn listening_query_rejects_invalid_arguments() {
+    let wrong_count = packet("/messenger/who/listening", vec![]);
+    assert!(matches!(
+        Message::try_from(&wrong_count),
+        Err(MessengerProtocolError::InvalidArgumentCount(_))
+    ));
+
+    let wrong_type = packet("/messenger/who/listening", vec![OscType::Int(1)]);
+    assert!(matches!(
+        Message::try_from(&wrong_type),
+        Err(MessengerProtocolError::ArgumentTypeMismatch(_))
+    ));
+}
+
 /// Tests Message::try_from with a bundle, which should give BundleNotSupported.
 #[test]
 fn message_try_from_bundle() {

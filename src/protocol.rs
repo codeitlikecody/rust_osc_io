@@ -5,6 +5,7 @@ use rosc::{OscMessage, OscPacket, OscType};
 const OSC_ADDRESS_ME_INTRODUCE: &str = "/messenger/me/introduce";
 const OSC_ADDRESS_ME_WELCOME: &str = "/messenger/me/welcome";
 const OSC_ADDRESS_ME_SAY: &str = "/messenger/me/say";
+const OSC_ADDRESS_ME_FAREWELL: &str = "/messenger/me/farewell";
 const OSC_ADDRESS_ME_LISTENING: &str = "/messenger/me/listening";
 const OSC_ADDRESS_WHO: &str = "/messenger/who";
 const OSC_ADDRESS_WHO_LISTENING: &str = "/messenger/who/listening";
@@ -62,6 +63,7 @@ impl Message {
                 Me::Introduce(_) => Cow::Borrowed(OSC_ADDRESS_ME_INTRODUCE),
                 Me::Welcome(_) => Cow::Borrowed(OSC_ADDRESS_ME_WELCOME),
                 Me::Say(_) => Cow::Borrowed(OSC_ADDRESS_ME_SAY),
+                Me::Farewell(_) => Cow::Borrowed(OSC_ADDRESS_ME_FAREWELL),
                 Me::SayInRoom(room_say) => Cow::Owned(format!(
                     "{OSC_ADDRESS_ME_ROOM_PREFIX}{}{OSC_ADDRESS_ME_ROOM_SAY_SUFFIX}",
                     room_say.room_name
@@ -93,6 +95,7 @@ impl Message {
                 Me::Introduce(user) => user.to_args(),
                 Me::Welcome(user) => user.to_args(),
                 Me::Say(message) => message.to_args(),
+                Me::Farewell(client) => client.to_args(),
                 Me::SayInRoom(room_say) => room_say.say.to_args(),
                 Me::Listening(client) => client.to_args(),
                 Me::ListeningInRoom(listening) => listening.client.to_args(),
@@ -181,6 +184,10 @@ impl TryFrom<&OscPacket> for Message {
                 },
                 OSC_ADDRESS_ME_SAY => match Say::from_args(&osc_message.args) {
                     Ok(say) => Ok(Message::Me(Me::Say(say))),
+                    Err(err) => Err(err),
+                },
+                OSC_ADDRESS_ME_FAREWELL => match MessengerClient::from_args(&osc_message.args) {
+                    Ok(client) => Ok(Message::Me(Me::Farewell(client))),
                     Err(err) => Err(err),
                 },
                 OSC_ADDRESS_ME_LISTENING => match MessengerClient::from_args(&osc_message.args) {
@@ -330,6 +337,7 @@ pub enum Me {
     Welcome(MessengerClient),
     Say(Say),
     SayInRoom(RoomSay),
+    Farewell(MessengerClient),
     Listening(MessengerClient),
     ListeningInRoom(RoomListening),
     EnterRoom(RoomEnter),
@@ -343,6 +351,7 @@ impl Me {
             Me::Welcome(_) => "welcome",
             Me::Say(_) => "say",
             Me::SayInRoom(_) => "say",
+            Me::Farewell(_) => "farewell",
             Me::Listening(_) => "listening",
             Me::ListeningInRoom(_) => "listening/room",
             Me::EnterRoom(_) => "enter",

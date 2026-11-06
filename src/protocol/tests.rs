@@ -68,6 +68,15 @@ fn say_wire_format() {
 }
 
 #[test]
+fn farewell_wire_format() {
+    assert_wire_format(
+        Message::Me(Me::Farewell(sample_client())),
+        "/messenger/me/farewell",
+        &["client_uuid", "Alice", "Protocol Test Client"],
+    );
+}
+
+#[test]
 fn room_say_wire_format() {
     assert_wire_format(
         Message::Me(Me::SayInRoom(RoomSay::new(
@@ -408,6 +417,18 @@ fn message_try_from_introduce_bad_args() {
 }
 
 #[test]
+fn message_try_from_farewell_bad_args() {
+    let packet = packet(
+        "/messenger/me/farewell",
+        string_args(&["client_uuid", "Alice"]),
+    );
+    assert!(matches!(
+        Message::try_from(&packet),
+        Err(MessengerProtocolError::InvalidArgumentCount(_))
+    ));
+}
+
+#[test]
 fn message_try_from_room_enter_bad_args() {
     let packet = packet(
         "/messenger/me/room/lobby/enter",
@@ -537,6 +558,7 @@ fn arb_message() -> impl Strategy<Value = Message> {
     prop_oneof![
         arb_client().prop_map(|c| Message::Me(Me::Introduce(c))),
         arb_client().prop_map(|c| Message::Me(Me::Welcome(c))),
+        arb_client().prop_map(|c| Message::Me(Me::Farewell(c))),
         arb_say().prop_map(|s| Message::Me(Me::Say(s))),
         (arb_room_name(), arb_say())
             .prop_map(|(room, say)| { Message::Me(Me::SayInRoom(RoomSay::new(room, say))) }),

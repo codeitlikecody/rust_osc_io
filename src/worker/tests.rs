@@ -129,6 +129,29 @@ fn received_welcome_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -
     }
 }
 
+fn received_farewell_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return false;
+        }
+
+        match handle.event_receiver().recv_timeout(timeout) {
+            Ok(OscWorkerEvent::MessageReceived(_, Message::Me(Me::Farewell(client))))
+                if client.client_uuid() == expected_client_uuid =>
+            {
+                return true;
+            }
+            Ok(OscWorkerEvent::Error(error)) => {
+                eprintln!("wire test worker error: {error:?}");
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
 fn received_listening_from_both(
     handle: &OscWorkerHandle,
     first_client_uuid: &str,
@@ -309,8 +332,9 @@ fn two_workers_exchange_welcomes_over_multicast() {
         received_listening_from_both(&first, &first_uuid, &second_uuid);
 
     first.stop_osc_worker().unwrap();
-    second.stop_osc_worker().unwrap();
+    let first_sent_farewell = received_farewell_from(&second, &first_uuid);
     first.join().unwrap();
+    second.stop_osc_worker().unwrap();
     second.join().unwrap();
 
     assert!(
@@ -341,5 +365,9 @@ fn two_workers_exchange_welcomes_over_multicast() {
     assert!(
         outside_replies_after_exit,
         "clients did not reply to outside-room query after first client exited"
+    );
+    assert!(
+        first_sent_farewell,
+        "first client did not broadcast its farewell"
     );
 }

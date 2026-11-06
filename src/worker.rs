@@ -228,6 +228,11 @@ fn spawn_osc_worker(
         match commands.try_recv() {
             Ok(command) => match command {
                 OscCommand::Stop => {
+                    send_farewell(destination, sender_address, &client, &events);
+                    leave_multicast_group(&socket, multicast_group, listener_address.ip())
+                        .unwrap_or_else(|e| {
+                            eprintln!("WORKER: Failed to leave multicast group: {e}")
+                        });
                     break;
                 }
                 OscCommand::SendMessage(message) => {
@@ -264,6 +269,7 @@ fn spawn_osc_worker(
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 // The main thread has disconnected, stop the receiver
+                send_farewell(destination, sender_address, &client, &events);
                 leave_multicast_group(&socket, multicast_group, listener_address.ip())
                     .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
                 events
@@ -343,6 +349,26 @@ fn spawn_osc_worker(
                 // return Err(OscWorkerError::IoError(error));
             }
         }
+    }
+}
+
+fn send_farewell(
+    destination: SocketAddrV4,
+    sender_address: SocketAddrV4,
+    client: &MessengerClient,
+    events: &mpsc::Sender<OscWorkerEvent>,
+) {
+    match send_osc_message(
+        destination,
+        sender_address,
+        Message::Me(Me::Farewell(client.clone())),
+    ) {
+        Ok(bytes_sent) => events
+            .send(OscWorkerEvent::MessageSent(bytes_sent))
+            .unwrap_or_else(|e| eprintln!("WORKER: Failed to send event: {e}")),
+        Err(error) => events
+            .send(OscWorkerEvent::Error(error))
+            .unwrap_or_else(|e| eprintln!("WORKER: Failed to send error event: {e}")),
     }
 }
 

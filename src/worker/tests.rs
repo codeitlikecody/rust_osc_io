@@ -17,7 +17,7 @@ fn welcomes_other_introducing_clients_with_own_identity() {
     let introduce = Message::Me(Me::Introduce(introduced_client));
 
     assert_eq!(
-        welcome_response(&introduce, &local_client),
+        response_to(&introduce, &local_client, None),
         Some(Message::Me(Me::Welcome(local_client)))
     );
 }
@@ -27,7 +27,7 @@ fn does_not_welcome_own_looped_back_introduction() {
     let local_client = client("local");
     let introduce = Message::Me(Me::Introduce(local_client.clone()));
 
-    assert_eq!(welcome_response(&introduce, &local_client), None);
+    assert_eq!(response_to(&introduce, &local_client, None), None);
 }
 
 #[test]
@@ -35,7 +35,26 @@ fn does_not_welcome_non_introduction_messages() {
     let local_client = client("local");
     let welcome = Message::Me(Me::Welcome(client("remote")));
 
-    assert_eq!(welcome_response(&welcome, &local_client), None);
+    assert_eq!(response_to(&welcome, &local_client, None), None);
+}
+
+#[test]
+fn replies_to_outside_room_query_when_not_in_that_room() {
+    let local_client = client("local");
+    let query = Message::Who(Who::Listening("lobby".to_string()));
+
+    assert_eq!(
+        response_to(&query, &local_client, None),
+        Some(Message::Me(Me::Listening(local_client)))
+    );
+}
+
+#[test]
+fn does_not_reply_to_outside_room_query_from_inside_that_room() {
+    let local_client = client("local");
+    let query = Message::Who(Who::Listening("lobby".to_string()));
+
+    assert_eq!(response_to(&query, &local_client, Some("lobby")), None);
 }
 
 fn received_welcome_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -> bool {
@@ -58,6 +77,29 @@ fn received_welcome_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -
                 }
                 _ => {}
             },
+            Err(_) => return false,
+        }
+    }
+}
+
+fn received_listening_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return false;
+        }
+
+        match handle.event_receiver().recv_timeout(timeout) {
+            Ok(OscWorkerEvent::MessageReceived(_, Message::Me(Me::Listening(client))))
+                if client.client_uuid() == expected_client_uuid =>
+            {
+                return true;
+            }
+            Ok(OscWorkerEvent::Error(error)) => {
+                eprintln!("wire test worker error: {error:?}");
+            }
+            Ok(_) => {}
             Err(_) => return false,
         }
     }
@@ -94,6 +136,11 @@ fn two_workers_exchange_welcomes_over_multicast() {
 
     let first_received_welcome = received_welcome_from(&first, &second_uuid);
     let second_received_welcome = received_welcome_from(&second, &first_uuid);
+    first
+        .query_listening_outside_room("lobby".to_string())
+        .unwrap();
+    let first_received_listening = received_listening_from(&first, &second_uuid);
+    let second_received_listening = received_listening_from(&second, &first_uuid);
 
     first.stop_osc_worker().unwrap();
     second.stop_osc_worker().unwrap();
@@ -107,5 +154,13 @@ fn two_workers_exchange_welcomes_over_multicast() {
     assert!(
         second_received_welcome,
         "second client did not receive first client's welcome"
+    );
+    assert!(
+        first_received_listening,
+        "first client did not receive second client's listening reply"
+    );
+    assert!(
+        second_received_listening,
+        "second client did not receive first client's listening reply"
     );
 }

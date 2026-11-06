@@ -5,6 +5,7 @@ use rosc::{OscMessage, OscPacket, OscType};
 const OSC_ADDRESS_ME_INTRODUCE: &str = "/messenger/me/introduce";
 const OSC_ADDRESS_ME_WELCOME: &str = "/messenger/me/welcome";
 const OSC_ADDRESS_ME_SAY: &str = "/messenger/me/say";
+const OSC_ADDRESS_ME_LISTENING: &str = "/messenger/me/listening";
 const OSC_ADDRESS_WHO: &str = "/messenger/who";
 const OSC_ADDRESS_WHO_LISTENING: &str = "/messenger/who/listening";
 const OSC_ADDRESS_ME_ROOM_PREFIX: &str = "/messenger/me/room/";
@@ -58,6 +59,7 @@ impl Message {
                 Me::Introduce(_) => Cow::Borrowed(OSC_ADDRESS_ME_INTRODUCE),
                 Me::Welcome(_) => Cow::Borrowed(OSC_ADDRESS_ME_WELCOME),
                 Me::Say(_) => Cow::Borrowed(OSC_ADDRESS_ME_SAY),
+                Me::Listening(_) => Cow::Borrowed(OSC_ADDRESS_ME_LISTENING),
                 Me::EnterRoom(room) => Cow::Owned(format!(
                     "{OSC_ADDRESS_ME_ROOM_PREFIX}{}{OSC_ADDRESS_ME_ROOM_ENTER_SUFFIX}",
                     room.room_name
@@ -79,6 +81,7 @@ impl Message {
                 Me::Introduce(user) => user.to_args(),
                 Me::Welcome(user) => user.to_args(),
                 Me::Say(message) => message.to_args(),
+                Me::Listening(client) => client.to_args(),
                 Me::EnterRoom(room) => room.client.to_args(),
                 Me::ExitRoom(room) => room.client.to_args(),
             },
@@ -159,6 +162,10 @@ impl TryFrom<&OscPacket> for Message {
                 },
                 OSC_ADDRESS_ME_SAY => match Say::from_args(&osc_message.args) {
                     Ok(say) => Ok(Message::Me(Me::Say(say))),
+                    Err(err) => Err(err),
+                },
+                OSC_ADDRESS_ME_LISTENING => match MessengerClient::from_args(&osc_message.args) {
+                    Ok(client) => Ok(Message::Me(Me::Listening(client))),
                     Err(err) => Err(err),
                 },
                 OSC_ADDRESS_WHO_LISTENING => {
@@ -254,6 +261,7 @@ pub enum Me {
     Introduce(MessengerClient),
     Welcome(MessengerClient),
     Say(Say),
+    Listening(MessengerClient),
     EnterRoom(RoomEnter),
     ExitRoom(RoomExit),
 }
@@ -264,6 +272,7 @@ impl Me {
             Me::Introduce(_) => "introduce",
             Me::Welcome(_) => "welcome",
             Me::Say(_) => "say",
+            Me::Listening(_) => "listening",
             Me::EnterRoom(_) => "enter",
             Me::ExitRoom(_) => "exit",
         }

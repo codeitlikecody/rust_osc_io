@@ -1,7 +1,7 @@
 use crate::config;
 use crate::net::{create_receiver_socket, leave_multicast_group, send_osc_message};
 use crate::protocol::{
-    Me, Message, MessengerClient, MessengerProtocolError, RoomEnter, RoomExit, Say,
+    Me, Message, MessengerClient, MessengerProtocolError, RoomEnter, RoomExit, Say, Who,
 };
 pub use rosc::OscError;
 use rosc::decoder;
@@ -184,6 +184,7 @@ fn spawn_osc_worker(
     client: MessengerClient,
 ) -> () {
     let mut buffer = [0u8; 65536];
+    let mut current_room: Option<String> = None;
     let destination = SocketAddrV4::new(multicast_group, listener_address.port());
     let socket = match create_receiver_socket(multicast_group, listener_address) {
         Ok(socket) => socket,
@@ -218,8 +219,24 @@ fn spawn_osc_worker(
                     break;
                 }
                 OscCommand::SendMessage(message) => {
+                    let room_transition = match &message {
+                        Message::Me(Me::EnterRoom(room)) => {
+                            Some((room.room_name().to_string(), true))
+                        }
+                        Message::Me(Me::ExitRoom(room)) => {
+                            Some((room.room_name().to_string(), false))
+                        }
+                        _ => None,
+                    };
                     match send_osc_message(destination, sender_address, message) {
                         Ok(bytes_sent) => {
+                            if let Some((room_name, entering)) = room_transition {
+                                if entering {
+                                    current_room = Some(room_name);
+                                } else if current_room.as_deref() == Some(&room_name) {
+                                    current_room = None;
+                                }
+                            }
                             events
                                 .send(OscWorkerEvent::MessageSent(bytes_sent))
                                 .unwrap_or_else(|e| eprintln!("WORKER: Failed to send event: {e}"));
@@ -256,14 +273,14 @@ fn spawn_osc_worker(
                 Ok((_, packet)) => {
                     match packet.try_into() {
                         Ok(message) => {
-                            let welcome = welcome_response(&message, &client);
+                            let response = response_to(&message, &client, current_room.as_deref());
                             events
                                 .send(OscWorkerEvent::MessageReceived(sender, message))
                                 .unwrap_or_else(|e| {
                                     eprintln!("Worker Error 822: Failed to send message received event: {e}")
                                 });
-                            if let Some(welcome) = welcome {
-                                match send_osc_message(destination, sender_address, welcome) {
+                            if let Some(response) = response {
+                                match send_osc_message(destination, sender_address, response) {
                                     Ok(bytes_sent) => {
                                         events
                                             .send(OscWorkerEvent::MessageSent(bytes_sent))
@@ -321,12 +338,19 @@ fn spawn_osc_worker(
     }
 }
 
-fn welcome_response(message: &Message, client: &MessengerClient) -> Option<Message> {
+fn response_to(
+    message: &Message,
+    client: &MessengerClient,
+    current_room: Option<&str>,
+) -> Option<Message> {
     match message {
         Message::Me(Me::Introduce(introduced_client))
             if introduced_client.client_uuid() != client.client_uuid() =>
         {
             Some(Message::Me(Me::Welcome(client.clone())))
+        }
+        Message::Who(Who::Listening(room_name)) if current_room != Some(room_name) => {
+            Some(Message::Me(Me::Listening(client.clone())))
         }
         _ => None,
     }

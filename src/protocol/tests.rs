@@ -169,6 +169,15 @@ fn welcome_wire_format() {
     );
 }
 
+#[test]
+fn listening_response_wire_format() {
+    assert_wire_format(
+        Message::Me(Me::Listening(sample_client())),
+        "/messenger/me/listening",
+        &["client_uuid", "Alice", "Protocol Test Client"],
+    );
+}
+
 /// Test the room-enter address and client payload encoding/decoding.
 #[test]
 fn room_enter_wire_format() {

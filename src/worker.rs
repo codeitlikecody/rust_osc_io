@@ -89,7 +89,7 @@ impl OscWorkerHandle {
         };
         let client = configured_client(&config);
         let worker_client = client.clone();
-        let thread = thread::spawn(move || {
+        let thread = thread::Builder::new().spawn(move || {
             spawn_osc_worker(
                 config.multicast_group,
                 config.listener_address,
@@ -98,7 +98,7 @@ impl OscWorkerHandle {
                 worker_events,
                 worker_client,
             )
-        });
+        })?;
 
         // check for events from the receiver thread and make sure we were able to start the receiver thread successfully
         // should not be blocking, since the receiver thread should send an event immediately after starting

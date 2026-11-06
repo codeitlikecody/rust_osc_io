@@ -48,10 +48,9 @@ pub fn leave_multicast_group(
 /// # Returns
 /// A `Result` containing the created `UdpSocket` or an `io::Error`
 pub fn create_sender_socket(sender_address: SocketAddrV4) -> io::Result<UdpSocket> {
-    UdpSocket::bind(sender_address).map(|socket| {
-        socket.set_multicast_loop_v4(true).unwrap();
-        socket
-    })
+    let socket = UdpSocket::bind(sender_address)?;
+    socket.set_multicast_loop_v4(true)?;
+    Ok(socket)
 }
 
 /// Sends an OSC message to the specified `destination_address` using the provided `sender_address`.

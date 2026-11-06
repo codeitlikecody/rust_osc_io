@@ -50,6 +50,7 @@ fn send_methods_reject_invalid_message_uuids_before_queueing() {
     let worker = OscWorkerHandle {
         commands_tx,
         events_rx,
+        dropped_events: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         thread: worker_thread,
         client: client("B0BAE0A0-3BBE-4004-888B-F61CA125D0B0"),
     };
@@ -86,10 +87,43 @@ fn join_requests_worker_shutdown() {
     let worker = OscWorkerHandle {
         commands_tx,
         events_rx,
+        dropped_events: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         thread: worker_thread,
         client: client("B0BAE0A0-3BBE-4004-888B-F61CA125D0B0"),
     };
 
+    worker.join().unwrap();
+}
+
+#[test]
+fn bounded_event_queue_counts_dropped_events() {
+    let (commands_tx, commands_rx) = mpsc::channel();
+    let (event_tx, events_rx) = mpsc::sync_channel(1);
+    let dropped_events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worker_dropped_events = std::sync::Arc::clone(&dropped_events);
+    let worker_thread = thread::spawn(move || {
+        assert!(matches!(commands_rx.recv(), Ok(OscCommand::Stop)));
+    });
+    let worker = OscWorkerHandle {
+        commands_tx,
+        events_rx,
+        dropped_events,
+        thread: worker_thread,
+        client: client("B0BAE0A0-3BBE-4004-888B-F61CA125D0B0"),
+    };
+    let event_sender = WorkerEventSender {
+        sender: event_tx,
+        dropped_events: worker_dropped_events,
+    };
+
+    event_sender.send(OscWorkerEvent::Started).unwrap();
+    event_sender.send(OscWorkerEvent::Stopped).unwrap();
+
+    assert_eq!(worker.dropped_event_count(), 1);
+    assert!(matches!(
+        worker.event_receiver().try_recv(),
+        Ok(OscWorkerEvent::Started)
+    ));
     worker.join().unwrap();
 }
 

@@ -8,8 +8,12 @@ pub use rosc::OscError;
 use rosc::decoder;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self};
 use std::thread::{self, JoinHandle};
+
+const EVENT_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Debug)]
 pub enum OscWorkerError {
@@ -25,6 +29,26 @@ pub enum OscWorkerEvent {
     MessageReceived(SocketAddr, Message),
     Error(OscWorkerError), // Error event can be used to report non fatal errors from the worker thread to the main thread.
 }
+
+#[derive(Clone)]
+struct WorkerEventSender {
+    sender: mpsc::SyncSender<OscWorkerEvent>,
+    dropped_events: Arc<AtomicUsize>,
+}
+
+impl WorkerEventSender {
+    fn send(&self, event: OscWorkerEvent) -> Result<(), &'static str> {
+        match self.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.dropped_events.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => Err("event receiver disconnected"),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum OscCommand {
     Stop,
@@ -37,6 +61,7 @@ enum OscCommand {
 pub struct OscWorkerHandle {
     commands_tx: mpsc::Sender<OscCommand>,
     events_rx: mpsc::Receiver<OscWorkerEvent>,
+    dropped_events: Arc<AtomicUsize>,
     thread: JoinHandle<()>,
     client: MessengerClient,
 }
@@ -55,7 +80,12 @@ impl OscWorkerHandle {
 
         // Create channels for controlling the receiver and returning events
         let (commands_tx, commands_rx) = mpsc::channel::<OscCommand>();
-        let (events_tx, events_rx) = mpsc::channel::<OscWorkerEvent>();
+        let (events_tx, events_rx) = mpsc::sync_channel::<OscWorkerEvent>(EVENT_QUEUE_CAPACITY);
+        let dropped_events = Arc::new(AtomicUsize::new(0));
+        let worker_events = WorkerEventSender {
+            sender: events_tx,
+            dropped_events: Arc::clone(&dropped_events),
+        };
         let client = configured_client(&config);
         let worker_client = client.clone();
         let thread = thread::spawn(move || {
@@ -64,7 +94,7 @@ impl OscWorkerHandle {
                 config.listener_address,
                 config.sender_address,
                 commands_rx,
-                events_tx,
+                worker_events,
                 worker_client,
             )
         });
@@ -99,6 +129,7 @@ impl OscWorkerHandle {
         let handle = OscWorkerHandle {
             commands_tx,
             events_rx,
+            dropped_events,
             thread,
             client,
         };
@@ -115,6 +146,11 @@ impl OscWorkerHandle {
     /// Returns a reference to the receiver for events from the worker thread.
     pub fn event_receiver(&self) -> &mpsc::Receiver<OscWorkerEvent> {
         &self.events_rx
+    }
+
+    /// Returns the cumulative number of events dropped because the event queue was full.
+    pub fn dropped_event_count(&self) -> usize {
+        self.dropped_events.load(Ordering::Relaxed)
     }
 
     pub fn client_uuid(&self) -> &str {
@@ -238,7 +274,7 @@ fn spawn_osc_worker(
     listener_address: SocketAddrV4,
     sender_address: SocketAddrV4,
     commands: mpsc::Receiver<OscCommand>,
-    events: mpsc::Sender<OscWorkerEvent>,
+    events: WorkerEventSender,
     client: MessengerClient,
 ) -> () {
     let mut buffer = [0u8; 65536];
@@ -407,7 +443,7 @@ fn spawn_osc_worker(
     }
 }
 
-fn notify_stopped(events: &mpsc::Sender<OscWorkerEvent>) {
+fn notify_stopped(events: &WorkerEventSender) {
     events
         .send(OscWorkerEvent::Stopped)
         .unwrap_or_else(|e| eprintln!("WORKER: Failed to send stopped event: {e}"));
@@ -417,7 +453,7 @@ fn send_farewell(
     destination: SocketAddrV4,
     sender_address: SocketAddrV4,
     client: &MessengerClient,
-    events: &mpsc::Sender<OscWorkerEvent>,
+    events: &WorkerEventSender,
 ) {
     match send_osc_message(
         destination,

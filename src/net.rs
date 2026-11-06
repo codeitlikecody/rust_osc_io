@@ -1,3 +1,4 @@
+use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 
@@ -16,7 +17,12 @@ pub fn create_receiver_socket(
     multicast_group: Ipv4Addr,
     listener_address: SocketAddrV4,
 ) -> Result<UdpSocket, io::Error> {
-    let socket = UdpSocket::bind(listener_address)?;
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.bind(&listener_address.into())?;
+    let socket: UdpSocket = socket.into();
     socket.join_multicast_v4(&multicast_group, &listener_address.ip())?;
     socket.set_multicast_loop_v4(true)?;
     Ok(socket)

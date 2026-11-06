@@ -77,15 +77,9 @@ impl Config {
     /// * `new_name` - The new client name to set.
     /// # Returns   
     /// A new Config instance with the updated client name.
-    pub fn set_name(&mut self, client_name: String) -> Self {
-        Config {
-            multicast_group: self.multicast_group,
-            listener_address: self.listener_address,
-            sender_address: self.sender_address,
-            client_name,
-            application_name: self.application_name.clone(),
-            client_uuid: self.client_uuid.clone(),
-        }
+    pub fn set_name(mut self, client_name: String) -> Self {
+        self.client_name = client_name;
+        self
     }
 
     /// Set the application name in the configuration.
@@ -93,26 +87,14 @@ impl Config {
     /// * `application_name` - The new application name to set.
     /// # Returns
     /// A new Config instance with the updated application name.    
-    pub fn set_application_name(&mut self, application_name: String) -> Self {
-        Config {
-            multicast_group: self.multicast_group,
-            listener_address: self.listener_address,
-            sender_address: self.sender_address,
-            client_name: self.client_name.clone(),
-            application_name,
-            client_uuid: self.client_uuid.clone(),
-        }
+    pub fn set_application_name(mut self, application_name: String) -> Self {
+        self.application_name = application_name;
+        self
     }
 
     /// Set a previously persisted client UUID. If omitted, the worker generates one.
-    pub fn set_client_uuid(&mut self, client_uuid: String) -> Self {
-        Config {
-            multicast_group: self.multicast_group,
-            listener_address: self.listener_address,
-            sender_address: self.sender_address,
-            client_name: self.client_name.clone(),
-            application_name: self.application_name.clone(),
-            client_uuid: Some(client_uuid),
-        }
+    pub fn set_client_uuid(mut self, client_uuid: String) -> Self {
+        self.client_uuid = Some(client_uuid);
+        self
     }
 }

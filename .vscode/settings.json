@@ -7,6 +7,7 @@
         "cargo search": true,
         "cargo info": true,
         "cargo check": true,
-        "npm --prefix /Users/ccod0001/coding/rust/rust_osc_io/desktop": true
+        "npm --prefix /Users/ccod0001/coding/rust/rust_osc_io/desktop": true,
+        "cargo run": true
     }
 }

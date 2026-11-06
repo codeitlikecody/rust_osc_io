@@ -134,6 +134,7 @@ function formatTime(timestamp: number) {
 export default function App() {
   const [identity, setIdentity] = useState(loadIdentity);
   const [connected, setConnected] = useState(false);
+  const [connecting, setConnecting] = useState(false);
   const [clientUuid, setClientUuid] = useState(identity.clientUuid);
   const [activeRoom, setActiveRoom] = useState<string | null>(null);
   const [sendToRoom, setSendToRoom] = useState(false);
@@ -147,6 +148,8 @@ export default function App() {
   const [droppedEvents, setDroppedEvents] = useState(0);
   const [sending, setSending] = useState(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
+  const startupConnectionAttempted = useRef(false);
+  const connectInProgress = useRef(false);
 
   useEffect(() => {
     localStorage.setItem(IDENTITY_KEY, JSON.stringify(identity));
@@ -164,7 +167,10 @@ export default function App() {
       if (!active) return;
       if (payload.kind === "stopped") {
         setConnected(false);
+        setConnecting(false);
         setActiveRoom(null);
+        setSendToRoom(false);
+        setSendRoom("");
         setContacts([]);
         return;
       }
@@ -250,11 +256,14 @@ export default function App() {
   }
 
   async function connect() {
-    if (!desktopBridgeAvailable) return;
+    if (!desktopBridgeAvailable || connected || connectInProgress.current) return;
     if (!identity.clientName.trim()) {
       setNotice("Add a callsign first.");
       return;
     }
+    connectInProgress.current = true;
+    setConnecting(true);
+    setNotice("");
     try {
       const result = await invoke<{ client_uuid: string }>("connect", {
         clientName: identity.clientName.trim(),
@@ -267,14 +276,25 @@ export default function App() {
       setNotice("");
     } catch (error) {
       setNotice(String(error));
+    } finally {
+      connectInProgress.current = false;
+      setConnecting(false);
     }
   }
+
+  useEffect(() => {
+    if (!desktopBridgeAvailable || startupConnectionAttempted.current) return;
+    startupConnectionAttempted.current = true;
+    void connect();
+  }, []);
 
   async function disconnect() {
     try {
       await invoke("disconnect");
       setConnected(false);
       setActiveRoom(null);
+      setSendToRoom(false);
+      setSendRoom("");
       setContacts([]);
     } catch (error) {
       setNotice(String(error));
@@ -382,7 +402,7 @@ export default function App() {
   }
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${connected ? "is-connected" : "is-disconnected"}`}>
       <aside className="sidebar">
         <div className="brand-lockup">
           <div className="brand-mark"><AudioLines size={21} strokeWidth={2.2} /></div>
@@ -393,15 +413,15 @@ export default function App() {
           <div className="section-label">YOUR STATION</div>
           <label className="field-label" htmlFor="client-name">Callsign</label>
           <input id="client-name" value={identity.clientName} maxLength={48} onChange={(event) => updateIdentity("clientName", event.target.value)} disabled={connected} />
-          <button className={`connection-button ${connected ? "is-connected" : ""}`} onClick={connected ? disconnect : connect} disabled={!desktopBridgeAvailable}>
+          <button className={`connection-button ${connected ? "is-connected" : ""}`} onClick={connected ? disconnect : connect} disabled={!desktopBridgeAvailable || connecting}>
             <span className="connection-indicator" />
-            {connected ? "Disconnect" : "Connect to OSC"}
+            {connecting ? "Connecting…" : connected ? "Disconnect" : "Connect to OSC"}
             {connected ? <X size={15} /> : <RadioTower size={15} />}
           </button>
-          <div className="connection-meta"><span>{connected ? "MULTICAST LINK ACTIVE" : "LINK STANDBY"}</span><span className="mono">239.254.0.1 : 3090</span></div>
+          <div className="connection-meta"><span>{connected ? "MULTICAST LINK ACTIVE" : connecting ? "CONNECTING TO OSC" : desktopBridgeAvailable ? "LINK STANDBY" : "NATIVE CLIENT REQUIRED"}</span><span className="mono">239.254.0.1 : 3090</span></div>
         </div>
 
-        <div className="channels-block">
+        {connected && <div className="channels-block">
           <div className="section-heading"><span className="section-label">CHANNEL</span><span className="live-dot" /></div>
           <button type="button" className={`channel-row channel-row-button ${!activeRoom && !sendToRoom ? "selected" : ""}`} onClick={() => void selectGlobalChannel()} aria-current={!activeRoom && !sendToRoom ? "page" : undefined} title="Switch to global channel">
             <MessageSquareText size={16} /><span>Global</span><span className="channel-tag">ALL</span>
@@ -422,7 +442,7 @@ export default function App() {
             </div>}
             {roomSearch && recentRoomSuggestions.length === 0 && recommendedRoomSuggestions.length === 0 && <div className="no-room-matches">No matching rooms</div>}
           </div>
-        </div>
+        </div>}
 
         <div className="sidebar-bottom">
           <div className="network-status"><span className={connected ? "status-led active" : "status-led"} /><span>{connected ? "OSC NETWORK" : "OFFLINE"}</span><span className="mono">UDP</span></div>
@@ -433,14 +453,14 @@ export default function App() {
       <section className="main-panel">
         <header className="topbar">
           <div className="channel-title"><div className="channel-icon">{displayRoom ? <Hash size={18} /> : <Radio size={18} />}</div><div><h1>{displayRoom ? formatRoomName(displayRoom) : "Global channel"}</h1><p>{activeRoom ? "ROOM TRANSMISSION" : sendToRoom ? "ROOM SEND ONLY" : "OPEN TRANSMISSION"}<span className="title-separator">/</span>{connected ? "LISTENING" : "AWAITING CONNECTION"}</p></div></div>
-          <div className="topbar-right"><span className="signal-label"><Activity size={14} /> {connected ? "SIGNAL READY" : "NO SIGNAL"}</span><span className="topbar-divider" /><span className="protocol-label">OSC <b>1.0</b></span></div>
+          <div className="topbar-right"><span className="signal-label"><Activity size={14} /> {connected ? "SIGNAL READY" : connecting ? "CONNECTING" : "NO SIGNAL"}</span><span className="topbar-divider" /><span className="protocol-label">OSC <b>1.0</b></span></div>
         </header>
 
         {!desktopBridgeAvailable && <div className="browser-notice">Open OSCMessenger as a desktop app to connect to the multicast network.</div>}
         {notice && <div className="notice" role="status"><span>{notice}</span><button title="Dismiss" aria-label="Dismiss" onClick={() => setNotice("")}><X size={15} /></button></div>}
-        {droppedEvents > 0 && <div className="drop-warning"><ArrowDownLeft size={15} /> {droppedEvents} network event{droppedEvents === 1 ? "" : "s"} dropped while the queue was full.</div>}
+        {connected && droppedEvents > 0 && <div className="drop-warning"><ArrowDownLeft size={15} /> {droppedEvents} network event{droppedEvents === 1 ? "" : "s"} dropped while the queue was full.</div>}
 
-        <div className="transcript" ref={transcriptRef}>
+        {connected ? <div className="transcript" ref={transcriptRef}>
           {visibleMessages.length === 0 ? (
             <div className="empty-state">
               <div className="empty-mark"><AudioLines size={27} /></div>
@@ -463,19 +483,24 @@ export default function App() {
               })}
             </div>
           )}
-        </div>
+        </div> : <div className="connection-state">
+          <div className="empty-mark"><RadioTower size={25} /></div>
+          <div className="empty-kicker">{!desktopBridgeAvailable ? "BROWSER PREVIEW" : connecting ? "CONNECTING TO OSC" : "OSC LINK OFFLINE"}</div>
+          <h2>{!desktopBridgeAvailable ? "Native client required." : connecting ? "Looking for the OSC network." : "Waiting for connection."}</h2>
+          <p>{!desktopBridgeAvailable ? "Open the desktop client to send messages and enter rooms." : connecting ? "Chat and room controls will appear when the link is ready." : "Use Connect to OSC to retry the network connection."}</p>
+        </div>}
 
-        <footer className="composer-wrap">
+        {connected && <footer className="composer-wrap">
           <form className="composer" onSubmit={sendMessage}>
             <div className="composer-leading"><span className="composer-dot" />{activeRoom ? <span>#{activeRoom} · {roomRole(activeRoom) ?? "Room"}</span> : <><select aria-label="Message destination" value={sendToRoom ? "room" : "global"} onChange={(event) => setSendToRoom(event.target.value === "room")} disabled={!connected}><option value="global">GLOBAL</option><option value="room">ROOM</option></select>{sendToRoom && <input className="target-room-input" aria-label="Room message destination" placeholder="room name" value={sendRoom} onChange={(event) => setSendRoom(event.target.value)} maxLength={64} disabled={!connected} />}</>}</div>
             <textarea value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={submitOnEnter} placeholder={connected ? "Transmit a message…" : "Connect to transmit"} maxLength={2048} rows={1} disabled={!connected} aria-label="Message" />
             <button type="submit" className="send-button" aria-label="Send message" title="Send message" disabled={!connected || !messageDraft.trim() || sending}><Send size={17} /></button>
           </form>
           <div className="composer-hint"><span>RETURN TO SEND <kbd>↵</kbd></span><span>SHIFT + RETURN FOR NEW LINE</span>{sendToRoom && !activeRoom && <span className="direct-send-note">NOT JOINED</span>}<span className="char-count">{messageDraft.length}/2048</span></div>
-        </footer>
+        </footer>}
       </section>
 
-      <aside className="details-panel">
+      {connected && <aside className="details-panel">
           <div className="details-header"><div className="section-label">CHANNEL DETAILS</div><div className="details-channel"><div className="details-channel-icon">{displayRoom ? <Hash size={16} /> : <Radio size={16} />}</div><div><strong>{displayRoom ? formatRoomName(displayRoom) : "Global"}</strong><span>{activeRoom ? "ROOM" : sendToRoom ? "DIRECT TARGET" : "MULTICAST"}</span></div></div></div>
         <div className="roster-section"><div className="roster-heading"><span>ON CHANNEL</span><span className="roster-count">{visibleContacts.length + (connected ? 1 : 0)}</span></div>
           {connected && <div className="roster-person"><div className="roster-avatar local">{identity.clientName.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{identity.clientName || "Unnamed station"}</strong><span>YOU</span></div><span className="roster-presence" /></div>}
@@ -485,7 +510,7 @@ export default function App() {
         </div>
         <div className="transport-section"><div className="section-label">TRANSPORT</div><div className="transport-row"><span>Protocol</span><strong>OSC over UDP</strong></div><div className="transport-row"><span>Multicast group</span><strong className="mono">239.254.0.1</strong></div><div className="transport-row"><span>Port</span><strong className="mono">3090</strong></div><div className="transport-row"><span>Client ID</span><strong className="mono">{clientUuid.slice(0, 8)}</strong></div></div>
         <div className="details-footer"><DoorOpen size={14} /><span>{sendToRoom && !activeRoom ? "DIRECT ROOM SEND DOES NOT JOIN THE ROOM" : "ROOM MEMBERSHIP IS LOCAL TO THIS CLIENT"}</span></div>
-      </aside>
+      </aside>}
     </main>
   );
 }

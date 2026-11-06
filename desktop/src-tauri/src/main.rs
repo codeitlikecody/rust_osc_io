@@ -65,8 +65,12 @@ fn connect(
     client_uuid: Option<String>,
 ) -> Result<ConnectionInfo, String> {
     let mut session = lock_session(&state);
-    if session.worker.is_some() {
-        return Err("Already connected".to_string());
+    if let Some(worker) = session.worker.as_ref() {
+        if !worker.is_finished() {
+            return Ok(ConnectionInfo {
+                client_uuid: worker.client_uuid().to_string(),
+            });
+        }
     }
 
     let mut config = Config::default()

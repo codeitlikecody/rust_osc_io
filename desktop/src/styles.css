@@ -55,6 +55,10 @@ textarea:focus-visible {
     background: radial-gradient(ellipse at 42% 0%, #202822 0%, #141916 37%, #101312 76%);
 }
 
+.app-shell.is-disconnected {
+    grid-template-columns: 248px minmax(380px, 1fr);
+}
+
 .sidebar,
 .details-panel {
     display: flex;
@@ -654,6 +658,33 @@ textarea:focus-visible {
     background: var(--green);
 }
 
+.connection-state {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    text-align: center;
+    animation: connection-in .35s ease both;
+}
+
+.connection-state h2 {
+    margin: 10px 0 7px;
+    color: #e7eae7;
+    font-size: 21px;
+    font-weight: 500;
+}
+
+.connection-state p {
+    max-width: 320px;
+    margin: 0;
+    color: #8b978e;
+    font-size: 12px;
+    line-height: 1.65;
+}
+
 .message-list {
     position: relative;
     z-index: 1;
@@ -1138,8 +1169,24 @@ textarea:focus-visible {
     }
 }
 
+@keyframes connection-in {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
 @media (max-width: 1100px) {
     .app-shell {
+        grid-template-columns: 220px minmax(360px, 1fr);
+    }
+
+    .app-shell.is-disconnected {
         grid-template-columns: 220px minmax(360px, 1fr);
     }
 
@@ -1161,6 +1208,10 @@ textarea:focus-visible {
     .app-shell {
         grid-template-columns: 1fr;
         min-height: 560px;
+    }
+
+    .app-shell.is-disconnected {
+        grid-template-columns: 1fr;
     }
 
     .sidebar {

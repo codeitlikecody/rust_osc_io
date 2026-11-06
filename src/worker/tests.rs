@@ -44,7 +44,7 @@ fn spawn_rejects_invalid_persisted_uuid_before_startup() {
 
 #[test]
 fn send_methods_reject_invalid_message_uuids_before_queueing() {
-    let (commands_tx, commands_rx) = mpsc::channel();
+    let (commands_tx, commands_rx) = mpsc::sync_channel(1);
     let (_events_tx, events_rx) = mpsc::channel();
     let worker_thread = thread::spawn(|| {});
     let worker = OscWorkerHandle {
@@ -79,7 +79,7 @@ fn send_methods_reject_invalid_message_uuids_before_queueing() {
 
 #[test]
 fn join_requests_worker_shutdown() {
-    let (commands_tx, commands_rx) = mpsc::channel();
+    let (commands_tx, commands_rx) = mpsc::sync_channel(1);
     let (_events_tx, events_rx) = mpsc::channel();
     let worker_thread = thread::spawn(move || {
         assert!(matches!(commands_rx.recv(), Ok(OscCommand::Stop)));
@@ -97,7 +97,7 @@ fn join_requests_worker_shutdown() {
 
 #[test]
 fn bounded_event_queue_counts_dropped_events() {
-    let (commands_tx, commands_rx) = mpsc::channel();
+    let (commands_tx, commands_rx) = mpsc::sync_channel(1);
     let (event_tx, events_rx) = mpsc::sync_channel(1);
     let dropped_events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let worker_dropped_events = std::sync::Arc::clone(&dropped_events);
@@ -124,6 +124,31 @@ fn bounded_event_queue_counts_dropped_events() {
         worker.event_receiver().try_recv(),
         Ok(OscWorkerEvent::Started)
     ));
+    worker.join().unwrap();
+}
+
+#[test]
+fn full_command_queue_returns_would_block() {
+    let (commands_tx, commands_rx) = mpsc::sync_channel(1);
+    commands_tx.try_send(OscCommand::Stop).unwrap();
+    let (_events_tx, events_rx) = mpsc::channel();
+    let worker = OscWorkerHandle {
+        commands_tx,
+        events_rx,
+        dropped_events: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        thread: thread::spawn(|| {}),
+        client: client("B0BAE0A0-3BBE-4004-888B-F61CA125D0B0"),
+    };
+
+    assert_eq!(
+        worker.say("hello".to_string()).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        worker.stop_osc_worker().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(matches!(commands_rx.try_recv(), Ok(OscCommand::Stop)));
     worker.join().unwrap();
 }
 

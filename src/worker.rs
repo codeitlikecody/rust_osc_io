@@ -14,6 +14,7 @@ use std::sync::mpsc::{self};
 use std::thread::{self, JoinHandle};
 
 const EVENT_QUEUE_CAPACITY: usize = 1024;
+const COMMAND_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Debug)]
 pub enum OscWorkerError {
@@ -59,7 +60,7 @@ enum OscCommand {
 }
 
 pub struct OscWorkerHandle {
-    commands_tx: mpsc::Sender<OscCommand>,
+    commands_tx: mpsc::SyncSender<OscCommand>,
     events_rx: mpsc::Receiver<OscWorkerEvent>,
     dropped_events: Arc<AtomicUsize>,
     thread: JoinHandle<()>,
@@ -79,7 +80,7 @@ impl OscWorkerHandle {
         }
 
         // Create channels for controlling the receiver and returning events
-        let (commands_tx, commands_rx) = mpsc::channel::<OscCommand>();
+        let (commands_tx, commands_rx) = mpsc::sync_channel::<OscCommand>(COMMAND_QUEUE_CAPACITY);
         let (events_tx, events_rx) = mpsc::sync_channel::<OscWorkerEvent>(EVENT_QUEUE_CAPACITY);
         let dropped_events = Arc::new(AtomicUsize::new(0));
         let worker_events = WorkerEventSender {
@@ -158,13 +159,17 @@ impl OscWorkerHandle {
     }
 
     /// Sends a command to the worker thread to stop it.
-    /// Returns an io::Error if the worker thread has already stopped.
+    /// Returns `WouldBlock` if the command queue is full.
     pub fn stop_osc_worker(&self) -> Result<(), io::Error> {
-        match self.commands_tx.send(OscCommand::Stop) {
+        match self.commands_tx.try_send(OscCommand::Stop) {
             Ok(()) => Ok(()),
-            Err(error) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to send stop command to worker thread: {error}"),
+            Err(mpsc::TrySendError::Full(_)) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Worker command queue is full",
+            )),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Worker thread has stopped",
             )),
         }
     }
@@ -232,11 +237,15 @@ impl OscWorkerHandle {
         message
             .to_osc()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        match self.commands_tx.send(OscCommand::SendMessage(message)) {
+        match self.commands_tx.try_send(OscCommand::SendMessage(message)) {
             Ok(()) => Ok(()),
-            Err(error) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to send message to worker thread: {error}"),
+            Err(mpsc::TrySendError::Full(_)) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Worker command queue is full",
+            )),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Worker thread has stopped",
             )),
         }
     }

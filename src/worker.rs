@@ -193,6 +193,9 @@ impl OscWorkerHandle {
     /// Sends a message to the worker thread.
     /// Returns an io::Error if the worker thread has already stopped.
     fn send_osc(&self, message: Message) -> Result<(), io::Error> {
+        message
+            .to_osc()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         match self.commands_tx.send(OscCommand::SendMessage(message)) {
             Ok(()) => Ok(()),
             Err(error) => Err(io::Error::new(

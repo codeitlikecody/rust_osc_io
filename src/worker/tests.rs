@@ -43,6 +43,40 @@ fn spawn_rejects_invalid_persisted_uuid_before_startup() {
 }
 
 #[test]
+fn send_methods_reject_invalid_message_uuids_before_queueing() {
+    let (commands_tx, commands_rx) = mpsc::channel();
+    let (_events_tx, events_rx) = mpsc::channel();
+    let worker_thread = thread::spawn(|| {});
+    let worker = OscWorkerHandle {
+        commands_tx,
+        events_rx,
+        thread: worker_thread,
+        client: client("B0BAE0A0-3BBE-4004-888B-F61CA125D0B0"),
+    };
+
+    let global_result = worker.say_with_uuid("invalid-id".to_string(), "hello".to_string());
+    let room_result = worker.say_in_room_with_uuid(
+        "lobby".to_string(),
+        "invalid-id".to_string(),
+        "hello".to_string(),
+    );
+
+    assert!(matches!(
+        global_result,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
+    ));
+    assert!(matches!(
+        room_result,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
+    ));
+    assert!(matches!(
+        commands_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    worker.join().unwrap();
+}
+
+#[test]
 fn welcomes_other_introducing_clients_with_own_identity() {
     let local_client = client("local");
     let introduced_client = client("remote");

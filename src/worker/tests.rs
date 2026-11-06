@@ -96,6 +96,16 @@ fn join_requests_worker_shutdown() {
 }
 
 #[test]
+fn abort_startup_requests_thread_exit_and_joins() {
+    let (commands_tx, commands_rx) = mpsc::sync_channel(1);
+    let worker_thread = thread::spawn(move || {
+        assert!(matches!(commands_rx.recv(), Ok(OscCommand::AbortStartup)));
+    });
+
+    abort_startup(&commands_tx, worker_thread);
+}
+
+#[test]
 fn bounded_event_queue_counts_dropped_events() {
     let (commands_tx, commands_rx) = mpsc::sync_channel(1);
     let (event_tx, events_rx) = mpsc::sync_channel(1);

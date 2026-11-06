@@ -53,6 +53,7 @@ impl WorkerEventSender {
 #[derive(Debug)]
 enum OscCommand {
     Stop,
+    AbortStartup,
     SendMessage(Message),
     // Future commands can be added here, such as changing the broadcast group.
     // Changing port will need the socket to be recreated with the new port, so it may be better to just stop the worker and start a new one with the new port.
@@ -107,6 +108,7 @@ impl OscWorkerHandle {
             Ok(OscWorkerEvent::Started) => {}
             Ok(OscWorkerEvent::Error(error)) => {
                 eprintln!("WORKER: Failed to start worker thread: {error:?}");
+                abort_startup(&commands_tx, thread);
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     format!("Failed to start worker thread: {error:?}"),
@@ -114,6 +116,7 @@ impl OscWorkerHandle {
             }
             Ok(event) => {
                 eprintln!("WORKER: Unexpected event from worker thread: {event:?}");
+                abort_startup(&commands_tx, thread);
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     format!("Unexpected event from worker thread: {event:?}"),
@@ -121,6 +124,7 @@ impl OscWorkerHandle {
             }
             Err(error) => {
                 eprintln!("WORKER: Failed to receive event from worker thread: {error}");
+                abort_startup(&commands_tx, thread);
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     format!("Failed to receive event from worker thread: {error}"),
@@ -258,6 +262,11 @@ impl OscWorkerHandle {
     }
 }
 
+fn abort_startup(commands: &mpsc::SyncSender<OscCommand>, thread: JoinHandle<()>) {
+    let _ = commands.try_send(OscCommand::AbortStartup);
+    let _ = thread.join();
+}
+
 fn configured_client(config: &config::Config) -> MessengerClient {
     match &config.client_uuid {
         Some(client_uuid) => MessengerClient::new_with_uuid(
@@ -319,6 +328,13 @@ fn spawn_osc_worker(
         // Check for commands from the main thread
         match commands.try_recv() {
             Ok(command) => match command {
+                OscCommand::AbortStartup => {
+                    leave_multicast_group(&socket, multicast_group, listener_address.ip())
+                        .unwrap_or_else(|e| {
+                            eprintln!("WORKER: Failed to leave multicast group: {e}")
+                        });
+                    break;
+                }
                 OscCommand::Stop => {
                     send_farewell(destination, sender_address, &client, &events);
                     leave_multicast_group(&socket, multicast_group, listener_address.ip())

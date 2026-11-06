@@ -57,6 +57,21 @@ fn does_not_reply_to_outside_room_query_from_inside_that_room() {
     assert_eq!(response_to(&query, &local_client, Some("lobby")), None);
 }
 
+#[test]
+fn replies_to_in_room_query_only_when_in_that_room() {
+    let local_client = client("local");
+    let query = Message::Who(Who::ListeningInRoom("lobby".to_string()));
+
+    assert_eq!(
+        response_to(&query, &local_client, Some("lobby")),
+        Some(Message::Me(Me::ListeningInRoom(RoomListening::new(
+            "lobby".to_string(),
+            local_client.clone(),
+        ))))
+    );
+    assert_eq!(response_to(&query, &local_client, None), None);
+}
+
 fn received_welcome_from(handle: &OscWorkerHandle, expected_client_uuid: &str) -> bool {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -105,6 +120,53 @@ fn received_listening_from(handle: &OscWorkerHandle, expected_client_uuid: &str)
     }
 }
 
+fn received_in_room_listening_from(
+    handle: &OscWorkerHandle,
+    expected_client_uuid: &str,
+    room_name: &str,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return false;
+        }
+
+        match handle.event_receiver().recv_timeout(timeout) {
+            Ok(OscWorkerEvent::MessageReceived(_, Message::Me(Me::ListeningInRoom(listening))))
+                if listening.room_name() == room_name
+                    && listening.client().client_uuid() == expected_client_uuid =>
+            {
+                return true;
+            }
+            Ok(OscWorkerEvent::Error(error)) => {
+                eprintln!("wire test worker error: {error:?}");
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+fn wait_for_message_sent(handle: &OscWorkerHandle) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return false;
+        }
+
+        match handle.event_receiver().recv_timeout(timeout) {
+            Ok(OscWorkerEvent::MessageSent(_)) => return true,
+            Ok(OscWorkerEvent::Error(error)) => {
+                eprintln!("wire test worker error: {error:?}");
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires multicast loopback and shared-port support"]
 fn two_workers_exchange_welcomes_over_multicast() {
@@ -141,6 +203,14 @@ fn two_workers_exchange_welcomes_over_multicast() {
         .unwrap();
     let first_received_listening = received_listening_from(&first, &second_uuid);
     let second_received_listening = received_listening_from(&second, &first_uuid);
+    first.enter_room("lobby".to_string()).unwrap();
+    assert!(
+        wait_for_message_sent(&first),
+        "first client did not enter lobby"
+    );
+    second.query_listening_in_room("lobby".to_string()).unwrap();
+    let first_received_in_room_listening =
+        received_in_room_listening_from(&first, &first_uuid, "lobby");
 
     first.stop_osc_worker().unwrap();
     second.stop_osc_worker().unwrap();
@@ -162,5 +232,9 @@ fn two_workers_exchange_welcomes_over_multicast() {
     assert!(
         second_received_listening,
         "second client did not receive first client's listening reply"
+    );
+    assert!(
+        first_received_in_room_listening,
+        "in-room client did not receive its listening reply"
     );
 }

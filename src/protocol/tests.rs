@@ -178,6 +178,27 @@ fn listening_response_wire_format() {
     );
 }
 
+#[test]
+fn in_room_listening_query_wire_format() {
+    assert_wire_format(
+        Message::Who(Who::ListeningInRoom("lobby".to_string())),
+        "/messenger/who/listening/room",
+        &["lobby"],
+    );
+}
+
+#[test]
+fn in_room_listening_response_wire_format() {
+    assert_wire_format(
+        Message::Me(Me::ListeningInRoom(RoomListening::new(
+            "lobby".to_string(),
+            sample_client(),
+        ))),
+        "/messenger/me/listening/room/lobby",
+        &["client_uuid", "Alice", "Protocol Test Client"],
+    );
+}
+
 /// Test the room-enter address and client payload encoding/decoding.
 #[test]
 fn room_enter_wire_format() {
@@ -311,6 +332,21 @@ fn listening_query_rejects_invalid_arguments() {
     ));
 
     let wrong_type = packet("/messenger/who/listening", vec![OscType::Int(1)]);
+    assert!(matches!(
+        Message::try_from(&wrong_type),
+        Err(MessengerProtocolError::ArgumentTypeMismatch(_))
+    ));
+}
+
+#[test]
+fn in_room_listening_query_rejects_invalid_arguments() {
+    let wrong_count = packet("/messenger/who/listening/room", vec![]);
+    assert!(matches!(
+        Message::try_from(&wrong_count),
+        Err(MessengerProtocolError::InvalidArgumentCount(_))
+    ));
+
+    let wrong_type = packet("/messenger/who/listening/room", vec![OscType::Int(1)]);
     assert!(matches!(
         Message::try_from(&wrong_type),
         Err(MessengerProtocolError::ArgumentTypeMismatch(_))

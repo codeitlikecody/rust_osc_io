@@ -1,7 +1,8 @@
 use crate::config;
 use crate::net::{create_receiver_socket, leave_multicast_group, send_osc_message};
 use crate::protocol::{
-    Me, Message, MessengerClient, MessengerProtocolError, RoomEnter, RoomExit, Say, Who,
+    Me, Message, MessengerClient, MessengerProtocolError, RoomEnter, RoomExit, RoomListening, Say,
+    Who,
 };
 pub use rosc::OscError;
 use rosc::decoder;
@@ -147,6 +148,10 @@ impl OscWorkerHandle {
 
     pub fn query_listening_outside_room(&self, room_name: String) -> Result<(), io::Error> {
         self.send_osc(Message::Who(crate::protocol::Who::Listening(room_name)))
+    }
+
+    pub fn query_listening_in_room(&self, room_name: String) -> Result<(), io::Error> {
+        self.send_osc(Message::Who(Who::ListeningInRoom(room_name)))
     }
 
     /// Sends a message to the worker thread.
@@ -351,6 +356,12 @@ fn response_to(
         }
         Message::Who(Who::Listening(room_name)) if current_room != Some(room_name) => {
             Some(Message::Me(Me::Listening(client.clone())))
+        }
+        Message::Who(Who::ListeningInRoom(room_name)) if current_room == Some(room_name) => {
+            Some(Message::Me(Me::ListeningInRoom(RoomListening::new(
+                room_name.clone(),
+                client.clone(),
+            ))))
         }
         _ => None,
     }

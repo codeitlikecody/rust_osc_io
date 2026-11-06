@@ -8,6 +8,8 @@ const OSC_ADDRESS_ME_SAY: &str = "/messenger/me/say";
 const OSC_ADDRESS_ME_LISTENING: &str = "/messenger/me/listening";
 const OSC_ADDRESS_WHO: &str = "/messenger/who";
 const OSC_ADDRESS_WHO_LISTENING: &str = "/messenger/who/listening";
+const OSC_ADDRESS_WHO_LISTENING_ROOM: &str = "/messenger/who/listening/room";
+const OSC_ADDRESS_ME_LISTENING_ROOM_PREFIX: &str = "/messenger/me/listening/room/";
 const OSC_ADDRESS_ME_ROOM_PREFIX: &str = "/messenger/me/room/";
 const OSC_ADDRESS_ME_ROOM_ENTER_SUFFIX: &str = "/enter";
 const OSC_ADDRESS_ME_ROOM_EXIT_SUFFIX: &str = "/exit";
@@ -60,6 +62,10 @@ impl Message {
                 Me::Welcome(_) => Cow::Borrowed(OSC_ADDRESS_ME_WELCOME),
                 Me::Say(_) => Cow::Borrowed(OSC_ADDRESS_ME_SAY),
                 Me::Listening(_) => Cow::Borrowed(OSC_ADDRESS_ME_LISTENING),
+                Me::ListeningInRoom(listening) => Cow::Owned(format!(
+                    "{OSC_ADDRESS_ME_LISTENING_ROOM_PREFIX}{}",
+                    listening.room_name
+                )),
                 Me::EnterRoom(room) => Cow::Owned(format!(
                     "{OSC_ADDRESS_ME_ROOM_PREFIX}{}{OSC_ADDRESS_ME_ROOM_ENTER_SUFFIX}",
                     room.room_name
@@ -71,6 +77,7 @@ impl Message {
             },
             Message::Who(Who::Todo) => Cow::Borrowed(OSC_ADDRESS_WHO),
             Message::Who(Who::Listening(_)) => Cow::Borrowed(OSC_ADDRESS_WHO_LISTENING),
+            Message::Who(Who::ListeningInRoom(_)) => Cow::Borrowed(OSC_ADDRESS_WHO_LISTENING_ROOM),
         }
     }
 
@@ -82,11 +89,15 @@ impl Message {
                 Me::Welcome(user) => user.to_args(),
                 Me::Say(message) => message.to_args(),
                 Me::Listening(client) => client.to_args(),
+                Me::ListeningInRoom(listening) => listening.client.to_args(),
                 Me::EnterRoom(room) => room.client.to_args(),
                 Me::ExitRoom(room) => room.client.to_args(),
             },
             Message::Who(Who::Todo) => vec![],
             Message::Who(Who::Listening(room_name)) => {
+                vec![OscType::String(room_name.clone())]
+            }
+            Message::Who(Who::ListeningInRoom(room_name)) => {
                 vec![OscType::String(room_name.clone())]
             }
         }
@@ -106,12 +117,13 @@ impl TryFrom<&Message> for OscPacket {
         let room_name = match message {
             Message::Me(Me::EnterRoom(room)) => Some(&room.room_name),
             Message::Me(Me::ExitRoom(room)) => Some(&room.room_name),
+            Message::Me(Me::ListeningInRoom(listening)) => Some(&listening.room_name),
             _ => None,
         };
         if let Some(room_name) = room_name {
             validate_room_name(room_name)?;
         }
-        if let Message::Who(Who::Listening(room_name)) = message {
+        if let Message::Who(Who::Listening(room_name) | Who::ListeningInRoom(room_name)) = message {
             validate_room_name(room_name)?;
         }
         // Check for null bytes in address or string arguments, as OSC strings are null-terminated and cannot contain null bytes.
@@ -168,48 +180,76 @@ impl TryFrom<&OscPacket> for Message {
                     Ok(client) => Ok(Message::Me(Me::Listening(client))),
                     Err(err) => Err(err),
                 },
-                OSC_ADDRESS_WHO_LISTENING => {
-                    if osc_message.args.len() != 1 {
-                        return Err(MessengerProtocolError::InvalidArgumentCount(format!(
-                            "Invalid number of arguments for listening query: expected 1, got {}",
-                            osc_message.args.len()
-                        )));
-                    }
-                    if let OscType::String(room_name) = &osc_message.args[0] {
-                        validate_room_name(room_name)?;
-                        Ok(Message::Who(Who::Listening(room_name.clone())))
-                    } else {
-                        Err(MessengerProtocolError::ArgumentTypeMismatch(
-                            "Invalid argument type for listening query".into(),
-                        ))
-                    }
-                }
+                OSC_ADDRESS_WHO_LISTENING => Ok(Message::Who(Who::Listening(
+                    parse_room_name_argument(&osc_message.args, "listening query")?,
+                ))),
+                OSC_ADDRESS_WHO_LISTENING_ROOM => Ok(Message::Who(Who::ListeningInRoom(
+                    parse_room_name_argument(&osc_message.args, "in-room listening query")?,
+                ))),
                 OSC_ADDRESS_WHO => Err(MessengerProtocolError::NotImplemented(
                     "Who message parsing not implemented".into(),
                 )),
-                _ => match room_action_from_address(&osc_message.addr) {
-                    Some((room_name, entering)) => {
+                _ => match listening_room_from_address(&osc_message.addr) {
+                    Some(room_name) => {
                         let client = MessengerClient::from_args(&osc_message.args)?;
-                        if entering {
-                            Ok(Message::Me(Me::EnterRoom(RoomEnter::new(
-                                room_name.to_string(),
-                                client,
-                            ))))
-                        } else {
-                            Ok(Message::Me(Me::ExitRoom(RoomExit::new(
-                                room_name.to_string(),
-                                client,
-                            ))))
-                        }
+                        Ok(Message::Me(Me::ListeningInRoom(RoomListening::new(
+                            room_name.to_string(),
+                            client,
+                        ))))
                     }
-                    None => Err(MessengerProtocolError::UnknownAddress(format!(
-                        "Unknown OSC address: {}",
-                        osc_message.addr
-                    ))),
+                    None => match room_action_from_address(&osc_message.addr) {
+                        Some((room_name, entering)) => {
+                            let client = MessengerClient::from_args(&osc_message.args)?;
+                            if entering {
+                                Ok(Message::Me(Me::EnterRoom(RoomEnter::new(
+                                    room_name.to_string(),
+                                    client,
+                                ))))
+                            } else {
+                                Ok(Message::Me(Me::ExitRoom(RoomExit::new(
+                                    room_name.to_string(),
+                                    client,
+                                ))))
+                            }
+                        }
+                        None => Err(MessengerProtocolError::UnknownAddress(format!(
+                            "Unknown OSC address: {}",
+                            osc_message.addr
+                        ))),
+                    },
                 },
             },
             OscPacket::Bundle(_) => Err(MessengerProtocolError::BundleNotSupported),
         }
+    }
+}
+
+fn parse_room_name_argument(
+    args: &[OscType],
+    description: &str,
+) -> Result<String, MessengerProtocolError> {
+    if args.len() != 1 {
+        return Err(MessengerProtocolError::InvalidArgumentCount(format!(
+            "Invalid number of arguments for {description}: expected 1, got {}",
+            args.len()
+        )));
+    }
+    if let OscType::String(room_name) = &args[0] {
+        validate_room_name(room_name)?;
+        Ok(room_name.clone())
+    } else {
+        Err(MessengerProtocolError::ArgumentTypeMismatch(format!(
+            "Invalid argument type for {description}"
+        )))
+    }
+}
+
+fn listening_room_from_address(address: &str) -> Option<&str> {
+    let room_name = address.strip_prefix(OSC_ADDRESS_ME_LISTENING_ROOM_PREFIX)?;
+    if room_name.is_empty() || room_name.contains('/') || room_name.contains('\0') {
+        None
+    } else {
+        Some(room_name)
     }
 }
 
@@ -253,6 +293,7 @@ pub enum Who {
     // TODO: Implement the Who message. For now, just a placeholder.
     Todo,
     Listening(String),
+    ListeningInRoom(String),
 }
 
 /// This enum represents a message sent by a client to the multicast group.
@@ -262,6 +303,7 @@ pub enum Me {
     Welcome(MessengerClient),
     Say(Say),
     Listening(MessengerClient),
+    ListeningInRoom(RoomListening),
     EnterRoom(RoomEnter),
     ExitRoom(RoomExit),
 }
@@ -273,9 +315,30 @@ impl Me {
             Me::Welcome(_) => "welcome",
             Me::Say(_) => "say",
             Me::Listening(_) => "listening",
+            Me::ListeningInRoom(_) => "listening/room",
             Me::EnterRoom(_) => "enter",
             Me::ExitRoom(_) => "exit",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomListening {
+    room_name: String,
+    client: MessengerClient,
+}
+
+impl RoomListening {
+    pub fn new(room_name: String, client: MessengerClient) -> Self {
+        Self { room_name, client }
+    }
+
+    pub fn room_name(&self) -> &str {
+        &self.room_name
+    }
+
+    pub fn client(&self) -> &MessengerClient {
+        &self.client
     }
 }
 

@@ -458,7 +458,7 @@ impl MessengerClient {
     /// A new MessengerClient with a random UUID, the given client name, and the given application name.
     pub fn new(client_name: String, application_name: String) -> Self {
         Self {
-            client_uuid: uuid::Uuid::new_v4().to_string(),
+            client_uuid: uuid::Uuid::new_v4().to_string().to_uppercase(),
             client_name,
             application_name,
         }
@@ -563,7 +563,11 @@ impl Say {
     /// # Returns
     /// A new Say message with a random UUID, the given client UUID, and the given message text.
     pub fn new(client_uuid: String, message: String) -> Self {
-        Self::new_with_uuid(uuid::Uuid::new_v4().to_string(), client_uuid, message)
+        Self::new_with_uuid(
+            uuid::Uuid::new_v4().to_string().to_uppercase(),
+            client_uuid,
+            message,
+        )
     }
 
     /// Creates a Say message with a caller-provided UUID.

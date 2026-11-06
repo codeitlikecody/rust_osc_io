@@ -472,6 +472,8 @@ fn say_new_unique_message_uuids() {
     let say1 = Say::new("client_uuid".into(), "Hello, World!".into());
     let say2 = Say::new("client_uuid".into(), "Hello, World!".into());
     assert_ne!(say1.message_uuid, say2.message_uuid);
+    assert_eq!(say1.message_uuid, say1.message_uuid.to_ascii_uppercase());
+    assert_eq!(say2.message_uuid, say2.message_uuid.to_ascii_uppercase());
 }
 
 /// Test Say::new for storing inputs.
@@ -484,15 +486,16 @@ fn say_new_storing_inputs() {
 
 #[test]
 fn say_new_with_uuid_preserves_message_uuid() {
+    let message_uuid = "b0bae0a0-3bbe-4004-888b-f61ca125d0b0";
     let say = Say::new_with_uuid(
-        "saved-message-id".to_string(),
+        message_uuid.to_string(),
         "client_uuid".to_string(),
         "Hello, World!".to_string(),
     );
 
     assert_eq!(
         say.to_args(),
-        string_args(&["saved-message-id", "client_uuid", "Hello, World!"])
+        string_args(&[message_uuid, "client_uuid", "Hello, World!"])
     );
 }
 
@@ -502,6 +505,26 @@ fn messenger_client_new_unique_uuids() {
     let client1 = MessengerClient::new("Alice".into(), "MyApp".into());
     let client2 = MessengerClient::new("Bob".into(), "MyApp".into());
     assert_ne!(client1.client_uuid, client2.client_uuid);
+    assert_eq!(
+        client1.client_uuid,
+        client1.client_uuid.to_ascii_uppercase()
+    );
+    assert_eq!(
+        client2.client_uuid,
+        client2.client_uuid.to_ascii_uppercase()
+    );
+}
+
+#[test]
+fn messenger_client_new_with_uuid_preserves_uuid_case() {
+    let client_uuid = "b0bae0a0-3bbe-4004-888b-f61ca125d0b0";
+    let client = MessengerClient::new_with_uuid(
+        client_uuid.to_string(),
+        "Alice".to_string(),
+        "MyApp".to_string(),
+    );
+
+    assert_eq!(client.client_uuid(), client_uuid);
 }
 
 /// Test MessengerClient::new for storing inputs

@@ -13,9 +13,10 @@ fn client(client_uuid: &str) -> MessengerClient {
 
 #[test]
 fn configured_client_uses_persisted_uuid() {
-    let config = config::Config::default().set_client_uuid("saved-client-id".to_string());
+    let saved_uuid = "b0bae0a0-3bbe-4004-888b-f61ca125d0b0";
+    let config = config::Config::default().set_client_uuid(saved_uuid.to_string());
 
-    assert_eq!(configured_client(&config).client_uuid(), "saved-client-id");
+    assert_eq!(configured_client(&config).client_uuid(), saved_uuid);
 }
 
 #[test]

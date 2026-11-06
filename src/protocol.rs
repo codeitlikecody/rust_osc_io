@@ -340,7 +340,7 @@ fn validate_outbound_uuids(message: &Message) -> Result<(), MessengerProtocolErr
     }
 }
 
-fn validate_uuid(value: &str) -> Result<(), MessengerProtocolError> {
+pub(crate) fn validate_uuid(value: &str) -> Result<(), MessengerProtocolError> {
     if value.len() == 36 && uuid::Uuid::parse_str(value).is_ok() {
         Ok(())
     } else {

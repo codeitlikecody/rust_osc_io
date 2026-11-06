@@ -2,7 +2,7 @@ use crate::config;
 use crate::net::{create_receiver_socket, leave_multicast_group, send_osc_message};
 use crate::protocol::{
     Me, Message, MessengerClient, MessengerProtocolError, RoomEnter, RoomExit, RoomListening,
-    RoomSay, Say, Who,
+    RoomSay, Say, Who, validate_uuid,
 };
 pub use rosc::OscError;
 use rosc::decoder;
@@ -48,6 +48,11 @@ pub struct OscWorkerHandle {
 impl OscWorkerHandle {
     /// Spawns a receiver thread that listens for OSC packets on the given multicast `group` and `port`.
     pub fn spawn(config: config::Config) -> Result<OscWorkerHandle, io::Error> {
+        if let Some(client_uuid) = config.client_uuid.as_deref() {
+            validate_uuid(client_uuid)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        }
+
         // Create channels for controlling the receiver and returning events
         let (commands_tx, commands_rx) = mpsc::channel::<OscCommand>();
         let (events_tx, events_rx) = mpsc::channel::<OscWorkerEvent>();

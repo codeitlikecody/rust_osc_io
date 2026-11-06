@@ -31,6 +31,18 @@ fn configured_client_generates_uuid_when_missing() {
 }
 
 #[test]
+fn spawn_rejects_invalid_persisted_uuid_before_startup() {
+    let config = config::Config::default().set_client_uuid("not-a-uuid".to_string());
+
+    let result = OscWorkerHandle::spawn(config);
+
+    assert!(matches!(
+        result,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
+    ));
+}
+
+#[test]
 fn welcomes_other_introducing_clients_with_own_identity() {
     let local_client = client("local");
     let introduced_client = client("remote");

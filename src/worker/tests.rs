@@ -77,6 +77,23 @@ fn send_methods_reject_invalid_message_uuids_before_queueing() {
 }
 
 #[test]
+fn join_requests_worker_shutdown() {
+    let (commands_tx, commands_rx) = mpsc::channel();
+    let (_events_tx, events_rx) = mpsc::channel();
+    let worker_thread = thread::spawn(move || {
+        assert!(matches!(commands_rx.recv(), Ok(OscCommand::Stop)));
+    });
+    let worker = OscWorkerHandle {
+        commands_tx,
+        events_rx,
+        thread: worker_thread,
+        client: client("B0BAE0A0-3BBE-4004-888B-F61CA125D0B0"),
+    };
+
+    worker.join().unwrap();
+}
+
+#[test]
 fn welcomes_other_introducing_clients_with_own_identity() {
     let local_client = client("local");
     let introduced_client = client("remote");

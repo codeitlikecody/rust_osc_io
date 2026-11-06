@@ -205,7 +205,10 @@ impl OscWorkerHandle {
         }
     }
 
+    /// Requests worker shutdown and waits for its thread to finish.
+    /// A failed stop request is ignored because the worker may already have exited.
     pub fn join(self) -> thread::Result<()> {
+        let _ = self.commands_tx.send(OscCommand::Stop);
         self.thread.join()
     }
 }

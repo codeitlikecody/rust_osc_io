@@ -3,6 +3,9 @@ use rosc::OscType;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
 
+const OUTSIDE_MESSAGE_UUID: &str = "D0BAE0A0-3BBE-4004-888B-F61CA125D0B0";
+const ROOM_MESSAGE_UUID: &str = "E0BAE0A0-3BBE-4004-888B-F61CA125D0B0";
+
 fn client(client_uuid: &str) -> MessengerClient {
     MessengerClient::new_with_uuid(
         client_uuid.to_string(),
@@ -200,6 +203,25 @@ fn received_farewell_from(handle: &OscWorkerHandle, expected_client_uuid: &str) 
             {
                 return true;
             }
+            Ok(OscWorkerEvent::Error(error)) => {
+                eprintln!("wire test worker error: {error:?}");
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+fn received_stopped(handle: &OscWorkerHandle) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return false;
+        }
+
+        match handle.event_receiver().recv_timeout(timeout) {
+            Ok(OscWorkerEvent::Stopped) => return true,
             Ok(OscWorkerEvent::Error(error)) => {
                 eprintln!("wire test worker error: {error:?}");
             }
@@ -468,13 +490,13 @@ fn two_workers_exchange_welcomes_over_multicast() {
     );
     second
         .say_with_uuid(
-            "outside-message-id".to_string(),
+            OUTSIDE_MESSAGE_UUID.to_string(),
             "Hello outside".to_string(),
         )
         .unwrap();
     let second_sent_global_say = wait_for_message_sent(&second);
     let second_received_global_say =
-        received_global_say_from(&second, &second_uuid, "outside-message-id", "Hello outside");
+        received_global_say_from(&second, &second_uuid, OUTSIDE_MESSAGE_UUID, "Hello outside");
     let first_did_not_receive_global_say =
         did_not_receive_global_say(&first, Duration::from_millis(500));
     second.query_listening_in_room("lobby".to_string()).unwrap();
@@ -483,7 +505,7 @@ fn two_workers_exchange_welcomes_over_multicast() {
     first
         .say_in_room_with_uuid(
             "lobby".to_string(),
-            "room-message-id".to_string(),
+            ROOM_MESSAGE_UUID.to_string(),
             "Hello from room".to_string(),
         )
         .unwrap();
@@ -491,7 +513,7 @@ fn two_workers_exchange_welcomes_over_multicast() {
     let first_received_room_say = received_room_say_from(
         &first,
         &first_uuid,
-        "room-message-id",
+        ROOM_MESSAGE_UUID,
         "lobby",
         "Hello from room",
     );
@@ -505,6 +527,7 @@ fn two_workers_exchange_welcomes_over_multicast() {
     let first_replied_after_exit = received_listening_from(&first, &first_uuid);
 
     first.stop_osc_worker().unwrap();
+    let first_stopped = received_stopped(&first);
     let first_sent_farewell = received_farewell_from(&second, &first_uuid);
     first.join().unwrap();
     second.stop_osc_worker().unwrap();
@@ -563,4 +586,5 @@ fn two_workers_exchange_welcomes_over_multicast() {
         first_sent_farewell,
         "first client did not broadcast its farewell"
     );
+    assert!(first_stopped, "first worker did not emit Stopped");
 }

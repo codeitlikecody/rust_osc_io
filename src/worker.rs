@@ -253,11 +253,6 @@ fn spawn_osc_worker(
         .send(OscWorkerEvent::Started)
         .unwrap_or_else(|e| eprintln!("WORKER: Failed to send started event: {e}"));
 
-    // Send a second notification to the client that the worker thread has started successfully
-    events
-        .send(OscWorkerEvent::Started)
-        .unwrap_or_else(|e| eprintln!("WORKER: Failed to send started event: {e}"));
-
     loop {
         // Check for commands from the main thread
         match commands.try_recv() {
@@ -268,6 +263,7 @@ fn spawn_osc_worker(
                         .unwrap_or_else(|e| {
                             eprintln!("WORKER: Failed to leave multicast group: {e}")
                         });
+                    notify_stopped(&events);
                     break;
                 }
                 OscCommand::SendMessage(message) => {
@@ -312,6 +308,7 @@ fn spawn_osc_worker(
                         io::Error::new(io::ErrorKind::ConnectionReset, "Main thread disconnected"),
                     )))
                     .unwrap_or_else(|e| eprintln!("WORKER: Failed to send error event: {e}"));
+                notify_stopped(&events);
                 break;
             }
         }
@@ -386,10 +383,17 @@ fn spawn_osc_worker(
                 send_farewell(destination, sender_address, &client, &events);
                 leave_multicast_group(&socket, multicast_group, listener_address.ip())
                     .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
+                notify_stopped(&events);
                 break;
             }
         }
     }
+}
+
+fn notify_stopped(events: &mpsc::Sender<OscWorkerEvent>) {
+    events
+        .send(OscWorkerEvent::Stopped)
+        .unwrap_or_else(|e| eprintln!("WORKER: Failed to send stopped event: {e}"));
 }
 
 fn send_farewell(

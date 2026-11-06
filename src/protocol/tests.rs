@@ -183,9 +183,35 @@ fn room_enter_wire_format() {
 }
 
 #[test]
+fn room_exit_wire_format() {
+    assert_wire_format(
+        Message::Me(Me::ExitRoom(RoomExit::new(
+            "lobby one".to_string(),
+            sample_client(),
+        ))),
+        "/messenger/me/room/lobby one/exit",
+        &["client_uuid", "Alice", "Protocol Test Client"],
+    );
+}
+
+#[test]
 fn room_enter_rejects_empty_or_slash_containing_names() {
     for room_name in ["", "parent/child"] {
         let message = Message::Me(Me::EnterRoom(RoomEnter::new(
+            room_name.to_string(),
+            sample_client(),
+        )));
+        assert!(matches!(
+            message.to_osc(),
+            Err(MessengerProtocolError::InvalidRoomName(_))
+        ));
+    }
+}
+
+#[test]
+fn room_exit_rejects_empty_or_slash_containing_names() {
+    for room_name in ["", "parent/child"] {
+        let message = Message::Me(Me::ExitRoom(RoomExit::new(
             room_name.to_string(),
             sample_client(),
         )));

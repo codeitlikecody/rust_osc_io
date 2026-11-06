@@ -8,6 +8,7 @@ const OSC_ADDRESS_ME_SAY: &str = "/messenger/me/say";
 const OSC_ADDRESS_WHO: &str = "/messenger/who";
 const OSC_ADDRESS_ME_ROOM_PREFIX: &str = "/messenger/me/room/";
 const OSC_ADDRESS_ME_ROOM_ENTER_SUFFIX: &str = "/enter";
+const OSC_ADDRESS_ME_ROOM_EXIT_SUFFIX: &str = "/exit";
 
 /// Protocol error type for the messenger application. This enum represents the different types of errors that can occur when parsing or constructing messages in the messenger protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +61,10 @@ impl Message {
                     "{OSC_ADDRESS_ME_ROOM_PREFIX}{}{OSC_ADDRESS_ME_ROOM_ENTER_SUFFIX}",
                     room.room_name
                 )),
+                Me::ExitRoom(room) => Cow::Owned(format!(
+                    "{OSC_ADDRESS_ME_ROOM_PREFIX}{}{OSC_ADDRESS_ME_ROOM_EXIT_SUFFIX}",
+                    room.room_name
+                )),
             },
             Message::Who(_) => Cow::Borrowed(OSC_ADDRESS_WHO),
         }
@@ -73,6 +78,7 @@ impl Message {
                 Me::Welcome(user) => user.to_args(),
                 Me::Say(message) => message.to_args(),
                 Me::EnterRoom(room) => room.client.to_args(),
+                Me::ExitRoom(room) => room.client.to_args(),
             },
             // TODO: Placeholder for Who message arguments.
             Message::Who(_) => vec![],
@@ -90,12 +96,13 @@ impl TryFrom<&Message> for OscPacket {
     fn try_from(message: &Message) -> Result<OscPacket, MessengerProtocolError> {
         let address = message.address();
         let args = message.args();
-        if let Message::Me(Me::EnterRoom(room)) = message {
-            if room.room_name.is_empty() || room.room_name.contains('/') {
-                return Err(MessengerProtocolError::InvalidRoomName(
-                    room.room_name.clone(),
-                ));
-            }
+        let room_name = match message {
+            Message::Me(Me::EnterRoom(room)) => Some(&room.room_name),
+            Message::Me(Me::ExitRoom(room)) => Some(&room.room_name),
+            _ => None,
+        };
+        if let Some(room_name) = room_name {
+            validate_room_name(room_name)?;
         }
         // Check for null bytes in address or string arguments, as OSC strings are null-terminated and cannot contain null bytes.
         for arg in &args {
@@ -153,13 +160,20 @@ impl TryFrom<&OscPacket> for Message {
                     OSC_ADDRESS_WHO => Err(MessengerProtocolError::NotImplemented(
                         "Who message parsing not implemented".into(),
                     )),
-                    _ => match room_name_from_address(&osc_message.addr) {
-                        Some(room_name) => {
+                    _ => match room_action_from_address(&osc_message.addr) {
+                        Some((room_name, entering)) => {
                             let client = MessengerClient::from_args(&osc_message.args)?;
-                            Ok(Message::Me(Me::EnterRoom(RoomEnter::new(
-                                room_name.to_string(),
-                                client,
-                            ))))
+                            if entering {
+                                Ok(Message::Me(Me::EnterRoom(RoomEnter::new(
+                                    room_name.to_string(),
+                                    client,
+                                ))))
+                            } else {
+                                Ok(Message::Me(Me::ExitRoom(RoomExit::new(
+                                    room_name.to_string(),
+                                    client,
+                                ))))
+                            }
                         }
                         None => Err(MessengerProtocolError::UnknownAddress(format!(
                             "Unknown OSC address: {}",
@@ -173,14 +187,30 @@ impl TryFrom<&OscPacket> for Message {
     }
 }
 
-fn room_name_from_address(address: &str) -> Option<&str> {
-    let room_name = address
-        .strip_prefix(OSC_ADDRESS_ME_ROOM_PREFIX)?
-        .strip_suffix(OSC_ADDRESS_ME_ROOM_ENTER_SUFFIX)?;
+fn room_action_from_address(address: &str) -> Option<(&str, bool)> {
+    let address = address.strip_prefix(OSC_ADDRESS_ME_ROOM_PREFIX)?;
+    let (room_name, entering) =
+        if let Some(room_name) = address.strip_suffix(OSC_ADDRESS_ME_ROOM_ENTER_SUFFIX) {
+            (room_name, true)
+        } else if let Some(room_name) = address.strip_suffix(OSC_ADDRESS_ME_ROOM_EXIT_SUFFIX) {
+            (room_name, false)
+        } else {
+            return None;
+        };
     if room_name.is_empty() || room_name.contains('/') || room_name.contains('\0') {
         None
     } else {
-        Some(room_name)
+        Some((room_name, entering))
+    }
+}
+
+fn validate_room_name(room_name: &str) -> Result<(), MessengerProtocolError> {
+    if room_name.is_empty() || room_name.contains('/') || room_name.contains('\0') {
+        Err(MessengerProtocolError::InvalidRoomName(
+            room_name.to_string(),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -205,6 +235,7 @@ pub enum Me {
     Welcome(MessengerClient),
     Say(Say),
     EnterRoom(RoomEnter),
+    ExitRoom(RoomExit),
 }
 impl Me {
     /// Returns part of the OSC address for the message type.
@@ -214,6 +245,7 @@ impl Me {
             Me::Welcome(_) => "welcome",
             Me::Say(_) => "say",
             Me::EnterRoom(_) => "enter",
+            Me::ExitRoom(_) => "exit",
         }
     }
 }
@@ -225,6 +257,26 @@ pub struct RoomEnter {
 }
 
 impl RoomEnter {
+    pub fn new(room_name: String, client: MessengerClient) -> Self {
+        Self { room_name, client }
+    }
+
+    pub fn room_name(&self) -> &str {
+        &self.room_name
+    }
+
+    pub fn client(&self) -> &MessengerClient {
+        &self.client
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomExit {
+    room_name: String,
+    client: MessengerClient,
+}
+
+impl RoomExit {
     pub fn new(room_name: String, client: MessengerClient) -> Self {
         Self { room_name, client }
     }

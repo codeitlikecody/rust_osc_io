@@ -514,17 +514,17 @@ fn two_workers_exchange_welcomes_over_multicast() {
     second.query_listening_in_room("lobby".to_string()).unwrap();
     let first_received_in_room_listening =
         received_in_room_listening_from(&first, &first_uuid, "lobby");
-    first
+    second
         .say_in_room_with_uuid(
             "lobby".to_string(),
             ROOM_MESSAGE_UUID.to_string(),
             "Hello from room".to_string(),
         )
         .unwrap();
-    let first_sent_room_say = wait_for_message_sent(&first);
+    let second_sent_room_say = wait_for_message_sent(&second);
     let first_received_room_say = received_room_say_from(
         &first,
-        &first_uuid,
+        &second_uuid,
         ROOM_MESSAGE_UUID,
         "lobby",
         "Hello from room",
@@ -579,15 +579,15 @@ fn two_workers_exchange_welcomes_over_multicast() {
     );
     assert!(
         first_received_room_say,
-        "room member did not receive first client's room message"
+        "room member did not receive outside client's room message"
     );
     assert!(
         second_did_not_receive_room_say,
         "client outside the room received a room-scoped message"
     );
     assert!(
-        first_sent_room_say,
-        "first client did not send its room message"
+        second_sent_room_say,
+        "outside client could not send a room-addressed message"
     );
     assert!(first_exited_room, "first client did not exit lobby");
     assert!(

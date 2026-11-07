@@ -7,10 +7,14 @@ import {
   AudioLines,
   DoorOpen,
   Hash,
+  ArrowLeft,
   MessageSquareText,
   Radio,
   RadioTower,
   Send,
+  Settings2,
+  Sun,
+  Moon,
   UsersRound,
   X,
 } from "lucide-react";
@@ -38,11 +42,33 @@ type SavedIdentity = {
   clientUuid: string;
 };
 
+type Preferences = {
+  multicastGroup: string;
+  listenerPort: string;
+  theme: "dark" | "light";
+  accent: "lime" | "cyan" | "amber" | "rose";
+  autoConnect: boolean;
+  enterToSend: boolean;
+  showTimestamps: boolean;
+  showPeerApplications: boolean;
+};
+
 const IDENTITY_KEY = "oscmessenger.identity.v1";
 const RECENT_ROOMS_KEY = "oscmessenger.recent-rooms.v1";
+const PREFERENCES_KEY = "oscmessenger.preferences.v1";
 const MAX_RECENT_ROOMS = 20;
 const GLOBAL_PRESENCE_QUERY_ROOM = "__OSCMESSENGER_GLOBAL_PRESENCE__";
 const desktopBridgeAvailable = "__TAURI_INTERNALS__" in window;
+const DEFAULT_PREFERENCES: Preferences = {
+  multicastGroup: "239.254.0.1",
+  listenerPort: "3090",
+  theme: "dark",
+  accent: "lime",
+  autoConnect: true,
+  enterToSend: true,
+  showTimestamps: true,
+  showPeerApplications: true,
+};
 const RECOMMENDED_ROOMS = [
   { name: "LX", role: "Lighting" },
   { name: "SM", role: "Stage management" },
@@ -111,6 +137,41 @@ function loadRecentRooms(): string[] {
   }
 }
 
+function loadPreferences(): Preferences {
+  try {
+    const saved = localStorage.getItem(PREFERENCES_KEY);
+    if (!saved) return DEFAULT_PREFERENCES;
+    const parsed = JSON.parse(saved) as Partial<Preferences>;
+    return {
+      multicastGroup: typeof parsed.multicastGroup === "string" ? parsed.multicastGroup : DEFAULT_PREFERENCES.multicastGroup,
+      listenerPort: typeof parsed.listenerPort === "string" ? parsed.listenerPort : DEFAULT_PREFERENCES.listenerPort,
+      theme: parsed.theme === "light" ? "light" : "dark",
+      accent: parsed.accent === "cyan" || parsed.accent === "amber" || parsed.accent === "rose" ? parsed.accent : "lime",
+      autoConnect: parsed.autoConnect !== false,
+      enterToSend: parsed.enterToSend !== false,
+      showTimestamps: parsed.showTimestamps !== false,
+      showPeerApplications: parsed.showPeerApplications !== false,
+    };
+  } catch {
+    return DEFAULT_PREFERENCES;
+  }
+}
+
+function isValidIpv4(value: string) {
+  const octets = value.trim().split(".");
+  return octets.length === 4 && octets.every((octet) => {
+    if (!/^\d{1,3}$/.test(octet)) return false;
+    const number = Number(octet);
+    return number >= 0 && number <= 255;
+  });
+}
+
+function isValidMulticastIpv4(value: string) {
+  if (!isValidIpv4(value)) return false;
+  const firstOctet = Number(value.trim().split(".")[0]);
+  return firstOctet >= 224 && firstOctet <= 239;
+}
+
 function roomFromAddress(address: string) {
   const prefix = "/messenger/me/room/";
   const suffix = "/say";
@@ -133,6 +194,9 @@ function formatTime(timestamp: number) {
 
 export default function App() {
   const [identity, setIdentity] = useState(loadIdentity);
+  const [preferences, setPreferences] = useState(loadPreferences);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsError, setSettingsError] = useState("");
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [clientUuid, setClientUuid] = useState(identity.clientUuid);
@@ -158,6 +222,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(RECENT_ROOMS_KEY, JSON.stringify(recentRooms));
   }, [recentRooms]);
+
+  useEffect(() => {
+    localStorage.setItem(PREFERENCES_KEY, JSON.stringify(preferences));
+  }, [preferences]);
 
   useEffect(() => {
     if (!desktopBridgeAvailable) return;
@@ -255,6 +323,10 @@ export default function App() {
     setIdentity((current) => ({ ...current, [field]: value }));
   }
 
+  function updatePreference<K extends keyof Preferences>(key: K, value: Preferences[K]) {
+    setPreferences((current) => ({ ...current, [key]: value }));
+  }
+
   async function connect() {
     if (!desktopBridgeAvailable || connected || connectInProgress.current) return;
     if (!identity.clientName.trim()) {
@@ -265,9 +337,15 @@ export default function App() {
     setConnecting(true);
     setNotice("");
     try {
+      const port = Number(preferences.listenerPort);
+      if (!isValidMulticastIpv4(preferences.multicastGroup) || !Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error("Enter an IPv4 multicast address (224–239 range) and port (1–65535).");
+      }
       const result = await invoke<{ client_uuid: string }>("connect", {
         clientName: identity.clientName.trim(),
         clientUuid: identity.clientUuid,
+        multicastGroup: preferences.multicastGroup.trim(),
+        listenerPort: port,
       });
       setClientUuid(result.client_uuid);
       setIdentity((current) => ({ ...current, clientUuid: result.client_uuid }));
@@ -283,7 +361,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (!desktopBridgeAvailable || startupConnectionAttempted.current) return;
+    if (!desktopBridgeAvailable || !preferences.autoConnect || startupConnectionAttempted.current) return;
     startupConnectionAttempted.current = true;
     void connect();
   }, []);
@@ -298,6 +376,67 @@ export default function App() {
       setContacts([]);
     } catch (error) {
       setNotice(String(error));
+    }
+  }
+
+  async function saveSettings(event: FormEvent) {
+    event.preventDefault();
+    setSettingsError("");
+    const multicastGroup = preferences.multicastGroup.trim();
+    const listenerPort = preferences.listenerPort.trim();
+    const port = Number(listenerPort);
+    const clientName = identity.clientName.trim();
+
+    if (!clientName) {
+      setSettingsError("Callsign cannot be empty.");
+      return;
+    }
+    if (!isValidMulticastIpv4(multicastGroup)) {
+      setSettingsError("Enter an IPv4 multicast address in the 224.0.0.0–239.255.255.255 range.");
+      return;
+    }
+    if (!/^\d+$/.test(listenerPort) || !Number.isInteger(port) || port < 1 || port > 65535) {
+      setSettingsError("Port must be a whole number between 1 and 65535.");
+      return;
+    }
+
+    const nextPreferences = { ...preferences, multicastGroup, listenerPort };
+    const nextIdentity = { ...identity, clientName };
+    const reconnect = connected && (
+      nextPreferences.multicastGroup !== preferences.multicastGroup ||
+      nextPreferences.listenerPort !== preferences.listenerPort ||
+      nextIdentity.clientName !== identity.clientName
+    );
+
+    setPreferences(nextPreferences);
+    setIdentity(nextIdentity);
+    setSettingsOpen(false);
+
+    if (!reconnect) return;
+    connectInProgress.current = true;
+    setConnecting(true);
+    try {
+      await invoke("disconnect");
+      setConnected(false);
+      setActiveRoom(null);
+      setContacts([]);
+      const result = await invoke<{ client_uuid: string }>("connect", {
+        clientName: nextIdentity.clientName,
+        clientUuid: nextIdentity.clientUuid,
+        multicastGroup: nextPreferences.multicastGroup,
+        listenerPort: port,
+      });
+      setClientUuid(result.client_uuid);
+      setIdentity({ ...nextIdentity, clientUuid: result.client_uuid });
+      setConnected(true);
+      await invoke("query_listening", { roomName: GLOBAL_PRESENCE_QUERY_ROOM, withinRoom: false });
+      setNotice("");
+    } catch (error) {
+      setConnected(false);
+      setNotice(String(error));
+    } finally {
+      connectInProgress.current = false;
+      setConnecting(false);
     }
   }
 
@@ -383,7 +522,7 @@ export default function App() {
   }
 
   function submitOnEnter(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (preferences.enterToSend && event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       event.currentTarget.form?.requestSubmit();
     }
@@ -402,7 +541,7 @@ export default function App() {
   }
 
   return (
-    <main className={`app-shell ${connected ? "is-connected" : "is-disconnected"}`}>
+    <main className={`app-shell ${connected ? "is-connected" : "is-disconnected"}`} data-theme={preferences.theme} data-accent={preferences.accent}>
       <aside className="sidebar">
         <div className="brand-lockup">
           <div className="brand-mark"><AudioLines size={21} strokeWidth={2.2} /></div>
@@ -411,14 +550,13 @@ export default function App() {
 
         <div className="connection-block">
           <div className="section-label">YOUR STATION</div>
-          <label className="field-label" htmlFor="client-name">Callsign</label>
-          <input id="client-name" value={identity.clientName} maxLength={48} onChange={(event) => updateIdentity("clientName", event.target.value)} disabled={connected} />
+          <div className="callsign-readout"><span>CALLSIGN</span><strong>{identity.clientName}</strong></div>
           <button className={`connection-button ${connected ? "is-connected" : ""}`} onClick={connected ? disconnect : connect} disabled={!desktopBridgeAvailable || connecting}>
             <span className="connection-indicator" />
             {connecting ? "Connecting…" : connected ? "Disconnect" : "Connect to OSC"}
             {connected ? <X size={15} /> : <RadioTower size={15} />}
           </button>
-          <div className="connection-meta"><span>{connected ? "MULTICAST LINK ACTIVE" : connecting ? "CONNECTING TO OSC" : desktopBridgeAvailable ? "LINK STANDBY" : "NATIVE CLIENT REQUIRED"}</span><span className="mono">239.254.0.1 : 3090</span></div>
+          <div className="connection-meta"><span>{connected ? "MULTICAST LINK ACTIVE" : connecting ? "CONNECTING TO OSC" : desktopBridgeAvailable ? "LINK STANDBY" : "NATIVE CLIENT REQUIRED"}</span><span className="mono">{preferences.multicastGroup} : {preferences.listenerPort}</span></div>
         </div>
 
         {connected && <div className="channels-block">
@@ -452,15 +590,48 @@ export default function App() {
 
       <section className="main-panel">
         <header className="topbar">
-          <div className="channel-title"><div className="channel-icon">{displayRoom ? <Hash size={18} /> : <Radio size={18} />}</div><div><h1>{displayRoom ? formatRoomName(displayRoom) : "Global channel"}</h1><p>{activeRoom ? "ROOM TRANSMISSION" : sendToRoom ? "ROOM SEND ONLY" : "OPEN TRANSMISSION"}<span className="title-separator">/</span>{connected ? "LISTENING" : "AWAITING CONNECTION"}</p></div></div>
-          <div className="topbar-right"><span className="signal-label"><Activity size={14} /> {connected ? "SIGNAL READY" : connecting ? "CONNECTING" : "NO SIGNAL"}</span><span className="topbar-divider" /><span className="protocol-label">OSC <b>1.0</b></span></div>
+          <div className="channel-title"><div className="channel-icon">{settingsOpen ? <Settings2 size={18} /> : displayRoom ? <Hash size={18} /> : <Radio size={18} />}</div><div><h1>{settingsOpen ? "Settings" : displayRoom ? formatRoomName(displayRoom) : "Global channel"}</h1><p>{settingsOpen ? "CLIENT PREFERENCES" : activeRoom ? "ROOM TRANSMISSION" : sendToRoom ? "ROOM SEND ONLY" : "OPEN TRANSMISSION"}<span className="title-separator">/</span>{connected ? "LISTENING" : connecting ? "CONNECTING" : "NO SIGNAL"}</p></div></div>
+          <div className="topbar-right"><span className="signal-label"><Activity size={14} /> {connected ? "SIGNAL READY" : connecting ? "CONNECTING" : "NO SIGNAL"}</span><span className="topbar-divider" /><span className="protocol-label">OSC <b>1.0</b></span><button type="button" className="settings-toggle" title={settingsOpen ? "Close settings" : "Settings"} aria-label={settingsOpen ? "Close settings" : "Settings"} onClick={() => { setSettingsOpen(!settingsOpen); setSettingsError(""); }}>{settingsOpen ? <X size={17} /> : <Settings2 size={17} />}</button></div>
         </header>
 
-        {!desktopBridgeAvailable && <div className="browser-notice">Open OSCMessenger as a desktop app to connect to the multicast network.</div>}
-        {notice && <div className="notice" role="status"><span>{notice}</span><button title="Dismiss" aria-label="Dismiss" onClick={() => setNotice("")}><X size={15} /></button></div>}
-        {connected && droppedEvents > 0 && <div className="drop-warning"><ArrowDownLeft size={15} /> {droppedEvents} network event{droppedEvents === 1 ? "" : "s"} dropped while the queue was full.</div>}
+        {settingsOpen && <section className="settings-page">
+          <div className="settings-intro"><button type="button" className="back-settings" onClick={() => setSettingsOpen(false)}><ArrowLeft size={15} /> Back to channel</button><span className="section-label">OSCMESSENGER DESKTOP</span><p>Network, identity, and display preferences for this device.</p></div>
+          <form className="settings-form" onSubmit={saveSettings}>
+            <section className="settings-group">
+              <div className="settings-group-heading"><span className="settings-index">01</span><div><h2>Identity</h2><p>How this station appears to other clients.</p></div></div>
+              <label className="settings-field"><span>Callsign</span><input value={identity.clientName} onChange={(event) => updateIdentity("clientName", event.target.value)} maxLength={48} autoComplete="off" /></label>
+            </section>
 
-        {connected ? <div className="transcript" ref={transcriptRef}>
+            <section className="settings-group">
+              <div className="settings-group-heading"><span className="settings-index">02</span><div><h2>Network</h2><p>Multicast destination and local listener port.</p></div></div>
+              <div className="settings-field-grid"><label className="settings-field"><span>Multicast IPv4 address</span><input value={preferences.multicastGroup} onChange={(event) => updatePreference("multicastGroup", event.target.value)} inputMode="decimal" spellCheck={false} placeholder="239.254.0.1" /></label><label className="settings-field port-field"><span>UDP port</span><input type="number" min="1" max="65535" step="1" value={preferences.listenerPort} onChange={(event) => updatePreference("listenerPort", event.target.value)} /></label></div>
+              <p className="settings-note">Network or callsign changes reconnect the client when saved.</p>
+            </section>
+
+            <section className="settings-group">
+              <div className="settings-group-heading"><span className="settings-index">03</span><div><h2>Appearance</h2><p>Theme and interface accent.</p></div></div>
+              <div className="settings-option-block"><span className="settings-option-label">Theme</span><div className="segmented-control"><button type="button" aria-pressed={preferences.theme === "dark"} onClick={() => updatePreference("theme", "dark")}><Moon size={15} /> Dark</button><button type="button" aria-pressed={preferences.theme === "light"} onClick={() => updatePreference("theme", "light")}><Sun size={15} /> Light</button></div></div>
+              <div className="settings-option-block"><span className="settings-option-label">Accent color</span><div className="accent-options">{(["lime", "cyan", "amber", "rose"] as const).map((accent) => <button type="button" key={accent} className={`accent-choice accent-${accent} ${preferences.accent === accent ? "selected" : ""}`} aria-label={`${accent} accent`} aria-pressed={preferences.accent === accent} onClick={() => updatePreference("accent", accent)} title={`${accent[0].toUpperCase()}${accent.slice(1)}`}><span /></button>)}</div></div>
+            </section>
+
+            <section className="settings-group">
+              <div className="settings-group-heading"><span className="settings-index">04</span><div><h2>Behavior</h2><p>Connection and chat preferences.</p></div></div>
+              <label className="settings-toggle"><span><strong>Connect on launch</strong><small>Attempt the OSC connection automatically when the desktop app starts.</small></span><input type="checkbox" checked={preferences.autoConnect} onChange={(event) => updatePreference("autoConnect", event.target.checked)} /><i /></label>
+              <label className="settings-toggle"><span><strong>Enter sends message</strong><small>Use Shift+Enter to insert a new line.</small></span><input type="checkbox" checked={preferences.enterToSend} onChange={(event) => updatePreference("enterToSend", event.target.checked)} /><i /></label>
+              <label className="settings-toggle"><span><strong>Show timestamps</strong><small>Display local receive time on each message.</small></span><input type="checkbox" checked={preferences.showTimestamps} onChange={(event) => updatePreference("showTimestamps", event.target.checked)} /><i /></label>
+              <label className="settings-toggle"><span><strong>Show peer applications</strong><small>Show the application name advertised by other stations.</small></span><input type="checkbox" checked={preferences.showPeerApplications} onChange={(event) => updatePreference("showPeerApplications", event.target.checked)} /><i /></label>
+            </section>
+
+            {settingsError && <div className="settings-error" role="alert">{settingsError}</div>}
+            <div className="settings-actions"><span>Preferences are saved on this device.</span><button type="submit" className="save-settings-button">Save settings</button></div>
+          </form>
+        </section>}
+
+        {!settingsOpen && !desktopBridgeAvailable && <div className="browser-notice">Open OSCMessenger as a desktop app to connect to the multicast network.</div>}
+        {!settingsOpen && notice && <div className="notice" role="status"><span>{notice}</span><button title="Dismiss" aria-label="Dismiss" onClick={() => setNotice("")}><X size={15} /></button></div>}
+        {!settingsOpen && connected && droppedEvents > 0 && <div className="drop-warning"><ArrowDownLeft size={15} /> {droppedEvents} network event{droppedEvents === 1 ? "" : "s"} dropped while the queue was full.</div>}
+
+        {!settingsOpen && (connected ? <div className="transcript" ref={transcriptRef}>
           {visibleMessages.length === 0 ? (
             <div className="empty-state">
               <div className="empty-mark"><AudioLines size={27} /></div>
@@ -477,7 +648,7 @@ export default function App() {
                 const contact = contacts.find((item) => item.id === message.senderId);
                 return <article className={`message ${own ? "own-message" : ""}`} key={message.id} style={{ animationDelay: `${Math.min(index, 8) * 35}ms` }}>
                   <div className={`avatar ${own ? "own-avatar" : ""}`}>{(own ? identity.clientName : contact?.name || message.senderId).slice(0, 1).toUpperCase()}</div>
-                  <div className="message-content"><div className="message-meta"><strong>{own ? `${identity.clientName} (you)` : contact?.name || message.senderId.slice(0, 8)}</strong><span>{formatTime(message.receivedAt)}</span>{!own && contact && <span className="app-tag">{contact.application}</span>}</div><p>{message.text}</p></div>
+                  <div className="message-content"><div className="message-meta"><strong>{own ? `${identity.clientName} (you)` : contact?.name || message.senderId.slice(0, 8)}</strong>{preferences.showTimestamps && <span>{formatTime(message.receivedAt)}</span>}{!own && contact && preferences.showPeerApplications && <span className="app-tag">{contact.application}</span>}</div><p>{message.text}</p></div>
                   <span className="message-kind">{own ? "OUT" : "IN"}</span>
                 </article>;
               })}
@@ -488,9 +659,9 @@ export default function App() {
           <div className="empty-kicker">{!desktopBridgeAvailable ? "BROWSER PREVIEW" : connecting ? "CONNECTING TO OSC" : "OSC LINK OFFLINE"}</div>
           <h2>{!desktopBridgeAvailable ? "Native client required." : connecting ? "Looking for the OSC network." : "Waiting for connection."}</h2>
           <p>{!desktopBridgeAvailable ? "Open the desktop client to send messages and enter rooms." : connecting ? "Chat and room controls will appear when the link is ready." : "Use Connect to OSC to retry the network connection."}</p>
-        </div>}
+        </div>)}
 
-        {connected && <footer className="composer-wrap">
+        {!settingsOpen && connected && <footer className="composer-wrap">
           <form className="composer" onSubmit={sendMessage}>
             <div className="composer-leading"><span className="composer-dot" />{activeRoom ? <span>#{activeRoom} · {roomRole(activeRoom) ?? "Room"}</span> : <><select aria-label="Message destination" value={sendToRoom ? "room" : "global"} onChange={(event) => setSendToRoom(event.target.value === "room")} disabled={!connected}><option value="global">GLOBAL</option><option value="room">ROOM</option></select>{sendToRoom && <input className="target-room-input" aria-label="Room message destination" placeholder="room name" value={sendRoom} onChange={(event) => setSendRoom(event.target.value)} maxLength={64} disabled={!connected} />}</>}</div>
             <textarea value={messageDraft} onChange={(event) => setMessageDraft(event.target.value)} onKeyDown={submitOnEnter} placeholder={connected ? "Transmit a message…" : "Connect to transmit"} maxLength={2048} rows={1} disabled={!connected} aria-label="Message" />
@@ -500,15 +671,15 @@ export default function App() {
         </footer>}
       </section>
 
-      {connected && <aside className="details-panel">
+      {connected && !settingsOpen && <aside className="details-panel">
           <div className="details-header"><div className="section-label">CHANNEL DETAILS</div><div className="details-channel"><div className="details-channel-icon">{displayRoom ? <Hash size={16} /> : <Radio size={16} />}</div><div><strong>{displayRoom ? formatRoomName(displayRoom) : "Global"}</strong><span>{activeRoom ? "ROOM" : sendToRoom ? "DIRECT TARGET" : "MULTICAST"}</span></div></div></div>
         <div className="roster-section"><div className="roster-heading"><span>ON CHANNEL</span><span className="roster-count">{visibleContacts.length + (connected ? 1 : 0)}</span></div>
           {connected && <div className="roster-person"><div className="roster-avatar local">{identity.clientName.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{identity.clientName || "Unnamed station"}</strong><span>YOU</span></div><span className="roster-presence" /></div>}
-          {visibleContacts.map((contact) => <div className="roster-person" key={contact.id}><div className="roster-avatar">{contact.name.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{contact.name}</strong><span>{contact.application}</span></div><span className="roster-presence" /></div>)}
+          {visibleContacts.map((contact) => <div className="roster-person" key={contact.id}><div className="roster-avatar">{contact.name.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{contact.name}</strong><span>{preferences.showPeerApplications ? contact.application : "ONLINE"}</span></div><span className="roster-presence" /></div>)}
           {!connected && <div className="roster-empty"><UsersRound size={17} /><span>No stations connected</span></div>}
           {connected && visibleContacts.length === 0 && <div className="roster-empty"><UsersRound size={17} /><span>Only you, for now</span></div>}
         </div>
-        <div className="transport-section"><div className="section-label">TRANSPORT</div><div className="transport-row"><span>Protocol</span><strong>OSC over UDP</strong></div><div className="transport-row"><span>Multicast group</span><strong className="mono">239.254.0.1</strong></div><div className="transport-row"><span>Port</span><strong className="mono">3090</strong></div><div className="transport-row"><span>Client ID</span><strong className="mono">{clientUuid.slice(0, 8)}</strong></div></div>
+        <div className="transport-section"><div className="section-label">TRANSPORT</div><div className="transport-row"><span>Protocol</span><strong>OSC over UDP</strong></div><div className="transport-row"><span>Multicast group</span><strong className="mono">{preferences.multicastGroup}</strong></div><div className="transport-row"><span>Port</span><strong className="mono">{preferences.listenerPort}</strong></div><div className="transport-row"><span>Client ID</span><strong className="mono">{clientUuid.slice(0, 8)}</strong></div></div>
         <div className="details-footer"><DoorOpen size={14} /><span>{sendToRoom && !activeRoom ? "DIRECT ROOM SEND DOES NOT JOIN THE ROOM" : "ROOM MEMBERSHIP IS LOCAL TO THIS CLIENT"}</span></div>
       </aside>}
     </main>

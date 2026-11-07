@@ -3,6 +3,7 @@ use rust_osc_io::config::Config;
 use rust_osc_io::worker::{OscWorkerEvent, OscWorkerHandle};
 use serde::Serialize;
 use std::io;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
@@ -63,6 +64,8 @@ fn connect(
     state: State<'_, AppState>,
     client_name: String,
     client_uuid: Option<String>,
+    multicast_group: String,
+    listener_port: u16,
 ) -> Result<ConnectionInfo, String> {
     let mut session = lock_session(&state);
     if let Some(worker) = session.worker.as_ref() {
@@ -72,10 +75,23 @@ fn connect(
             });
         }
     }
+    if listener_port == 0 {
+        return Err("Listener port must be between 1 and 65535".to_string());
+    }
+    let multicast_group = multicast_group
+        .parse::<Ipv4Addr>()
+        .map_err(|_| "Multicast group must be a valid IPv4 address".to_string())?;
+    if !multicast_group.is_multicast() {
+        return Err("Multicast group must be in the IPv4 multicast range".to_string());
+    }
 
-    let mut config = Config::default()
-        .set_name(client_name)
-        .set_application_name(application_name());
+    let mut config = Config::new(
+        Some(multicast_group),
+        Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listener_port)),
+        None,
+        Some(client_name),
+        Some(application_name()),
+    );
     if let Some(client_uuid) = client_uuid.filter(|value| !value.trim().is_empty()) {
         config = config.set_client_uuid(client_uuid);
     }

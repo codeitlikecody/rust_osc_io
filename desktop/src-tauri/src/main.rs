@@ -1,15 +1,30 @@
+use axum::extract::ws::{Message as WebSocketMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, State as AxumState};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use rosc::OscType;
+use rust_embed::RustEmbed;
 use rust_osc_io::config::{Config, DEFAULT_MULTICAST_GROUP, NetworkMode};
 use rust_osc_io::gateway::{GatewayConfig, discover_active_gateways, run_gateway};
 use rust_osc_io::worker::{OscWorkerEvent, OscWorkerHandle};
-use serde::Serialize;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::sync::{Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::{broadcast, watch};
+
+const WEB_INTERFACE_PORT: u16 = 9140;
+
+#[derive(RustEmbed)]
+#[folder = "../dist/"]
+struct EmbeddedFrontend;
 
 fn application_name() -> String {
     let platform = match std::env::consts::OS {
@@ -30,15 +45,46 @@ struct Session {
     active_room: Option<String>,
 }
 
-#[derive(Default)]
 struct AppState {
     session: Mutex<Session>,
     gateway: Mutex<Option<GatewayRuntime>>,
+    browser_events: broadcast::Sender<BrowserEvent>,
+    web_server: Mutex<Option<WebServerRuntime>>,
+    web_server_control: Mutex<()>,
+    web_interface_url: Mutex<Option<String>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        let (browser_events, _) = broadcast::channel(512);
+        Self {
+            session: Mutex::new(Session::default()),
+            gateway: Mutex::new(None),
+            browser_events,
+            web_server: Mutex::new(None),
+            web_server_control: Mutex::new(()),
+            web_interface_url: Mutex::new(None),
+        }
+    }
 }
 
 struct GatewayRuntime {
     shutdown: mpsc::Sender<()>,
     thread: JoinHandle<()>,
+}
+
+struct WebServerRuntime {
+    port: u16,
+    shutdown: watch::Sender<bool>,
+    thread: JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct WebServerState {
+    app: AppHandle,
+    events: broadcast::Sender<BrowserEvent>,
+    shutdown: watch::Receiver<bool>,
+    port: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,6 +99,15 @@ struct GatewayStatus {
     state: String,
     gateway_uuid: Option<String>,
     detail: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "event", content = "payload")]
+enum BrowserEvent {
+    #[serde(rename = "worker-event")]
+    Worker(UiEvent),
+    #[serde(rename = "gateway-status")]
+    Gateway(GatewayStatus),
 }
 
 #[derive(Serialize)]
@@ -85,6 +140,365 @@ enum UiEvent {
     DroppedEvents {
         total: usize,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectRequest {
+    client_name: String,
+    client_uuid: Option<String>,
+    network_mode: String,
+    multicast_group: String,
+    multicast_interfaces: Vec<String>,
+    listener_port: u16,
+    unicast_address: String,
+    unicast_port: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoomRequest {
+    room_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageRequest {
+    message_uuid: String,
+    text: String,
+    room_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListeningRequest {
+    room_name: String,
+    within_room: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigureGatewayRequest {
+    enabled: bool,
+    conflict_policy: String,
+    multicast_group: String,
+    multicast_interfaces: Vec<String>,
+    listener_port: u16,
+}
+
+fn parse_browser_request<T: DeserializeOwned>(value: Value) -> Result<T, (StatusCode, String)> {
+    serde_json::from_value(value).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid command payload: {error}"),
+        )
+    })
+}
+
+fn browser_command_result<T: Serialize>(
+    result: Result<T, String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match result {
+        Ok(value) => serde_json::to_value(value)
+            .map(Json)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
+        Err(error) => Err((StatusCode::BAD_REQUEST, error)),
+    }
+}
+
+fn is_local_browser_request(headers: &HeaderMap, port: u16) -> bool {
+    let expected_hosts = [format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+    let host_is_local = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| expected_hosts.iter().any(|expected| host == expected));
+    let origin_is_local = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|origin| {
+            origin == format!("http://127.0.0.1:{port}")
+                || origin == format!("http://localhost:{port}")
+        });
+    host_is_local && origin_is_local
+}
+
+async fn browser_command(
+    AxumState(web): AxumState<WebServerState>,
+    Path(command): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !is_local_browser_request(&headers, web.port) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Local browser origin required".to_string(),
+        ));
+    }
+    let app = web.app.clone();
+    match command.as_str() {
+        "connect" => {
+            let request: ConnectRequest = parse_browser_request(payload)?;
+            browser_command_result(connect(
+                app.clone(),
+                app.state::<AppState>(),
+                request.client_name,
+                request.client_uuid,
+                request.network_mode,
+                request.multicast_group,
+                request.multicast_interfaces,
+                request.listener_port,
+                request.unicast_address,
+                request.unicast_port,
+            ))
+        }
+        "get_network_interfaces" => browser_command_result(get_network_interfaces()),
+        "configure_gateway" => {
+            let request: ConfigureGatewayRequest = parse_browser_request(payload)?;
+            browser_command_result(configure_gateway(
+                app,
+                web.app.state::<AppState>(),
+                request.enabled,
+                request.conflict_policy,
+                request.multicast_group,
+                request.multicast_interfaces,
+                request.listener_port,
+            ))
+        }
+        "disconnect" => browser_command_result(disconnect(app.clone(), app.state::<AppState>())),
+        "enter_room" => {
+            let request: RoomRequest = parse_browser_request(payload)?;
+            browser_command_result(enter_room(app.state::<AppState>(), request.room_name))
+        }
+        "exit_room" => {
+            let request: RoomRequest = parse_browser_request(payload)?;
+            browser_command_result(exit_room(app.state::<AppState>(), request.room_name))
+        }
+        "send_message" => {
+            let request: MessageRequest = parse_browser_request(payload)?;
+            browser_command_result(send_message(
+                app.state::<AppState>(),
+                request.message_uuid,
+                request.text,
+                request.room_name,
+            ))
+        }
+        "query_listening" => {
+            let request: ListeningRequest = parse_browser_request(payload)?;
+            browser_command_result(query_listening(
+                app.state::<AppState>(),
+                request.room_name,
+                request.within_room,
+            ))
+        }
+        "get_web_interface_url" => {
+            browser_command_result(get_web_interface_url(app.state::<AppState>()))
+        }
+        _ => Err((StatusCode::NOT_FOUND, "Unknown desktop command".to_string())),
+    }
+}
+
+async fn browser_events(
+    upgrade: WebSocketUpgrade,
+    headers: HeaderMap,
+    AxumState(web): AxumState<WebServerState>,
+) -> Result<Response, (StatusCode, String)> {
+    if !is_local_browser_request(&headers, web.port) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Local browser origin required".to_string(),
+        ));
+    }
+    let events = web.events.subscribe();
+    let shutdown = web.shutdown.clone();
+    Ok(upgrade
+        .on_upgrade(move |socket| pump_browser_events(socket, events, shutdown))
+        .into_response())
+}
+
+async fn pump_browser_events(
+    mut socket: WebSocket,
+    mut events: broadcast::Receiver<BrowserEvent>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                Some(Ok(WebSocketMessage::Close(_))) | None | Some(Err(_)) => break,
+                _ => {}
+            },
+            event = events.recv() => match event {
+                Ok(event) => {
+                    let Ok(json) = serde_json::to_string(&event) else { continue };
+                    if socket.send(WebSocketMessage::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    let _ = socket.send(WebSocketMessage::Close(None)).await;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn serve_web_asset(uri: Uri) -> Response {
+    let requested = uri.path().trim_start_matches('/');
+    let asset_path = if requested.is_empty() {
+        "index.html"
+    } else {
+        requested
+    };
+    let Some(asset) =
+        EmbeddedFrontend::get(asset_path).or_else(|| EmbeddedFrontend::get("index.html"))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let (path, bytes) = if asset_path == "index.html" || EmbeddedFrontend::get(asset_path).is_none()
+    {
+        let html = String::from_utf8_lossy(&asset.data).replace(
+            "</head>",
+            "<script>window.__OSCMESSENGER_WEB_BRIDGE__=true;</script></head>",
+        );
+        ("index.html", html.into_bytes())
+    } else {
+        (asset_path, asset.data.into_owned())
+    };
+    let content_type = mime_guess::from_path(path).first_or_octet_stream();
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type.as_ref())
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(axum::body::Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn start_web_interface(app: AppHandle) -> io::Result<WebServerRuntime> {
+    let listener = (WEB_INTERFACE_PORT..WEB_INTERFACE_PORT.saturating_add(11))
+        .find_map(|port| {
+            TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))).ok()
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "No available local web interface port",
+            )
+        })?;
+    listener.set_nonblocking(true)?;
+    let port = listener.local_addr()?.port();
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let web = WebServerState {
+        events: app.state::<AppState>().browser_events.clone(),
+        app,
+        shutdown: shutdown_rx.clone(),
+        port,
+    };
+    let thread = thread::Builder::new()
+        .name("oscmessenger-web-interface".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("Failed to create web interface runtime: {error}");
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let listener = match tokio::net::TcpListener::from_std(listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("Failed to create web interface listener: {error}");
+                        return;
+                    }
+                };
+                let router = Router::new()
+                    .route("/api/commands/{command}", post(browser_command))
+                    .route("/api/events", get(browser_events))
+                    .fallback(get(serve_web_asset))
+                    .with_state(web);
+                let shutdown_signal = async move {
+                    let mut receiver = shutdown_rx;
+                    if !*receiver.borrow() {
+                        let _ = receiver.changed().await;
+                    }
+                };
+                if let Err(error) = axum::serve(listener, router)
+                    .with_graceful_shutdown(shutdown_signal)
+                    .await
+                {
+                    eprintln!("Web interface server stopped: {error}");
+                }
+            });
+        })?;
+    Ok(WebServerRuntime {
+        port,
+        shutdown,
+        thread,
+    })
+}
+
+fn stop_web_interface(state: &AppState) {
+    let runtime = state
+        .web_server
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(runtime) = runtime {
+        let _ = runtime.shutdown.send(true);
+        if runtime.thread.join().is_err() {
+            eprintln!("Web interface thread panicked during shutdown");
+        }
+    }
+}
+
+#[tauri::command]
+fn get_web_interface_url(state: State<'_, AppState>) -> Result<String, String> {
+    lock_web_url(&state)
+        .clone()
+        .ok_or_else(|| "Web interface server is not running".to_string())
+}
+
+#[tauri::command]
+fn configure_web_interface(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<Option<String>, String> {
+    let _control = state
+        .web_server_control
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !enabled {
+        stop_web_interface(&state);
+        *lock_web_url(&state) = None;
+        return Ok(None);
+    }
+
+    if let Some(url) = lock_web_url(&state).clone() {
+        return Ok(Some(url));
+    }
+
+    let runtime = start_web_interface(app).map_err(|error| error.to_string())?;
+    let url = format!("http://127.0.0.1:{}/", runtime.port);
+    *state
+        .web_server
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
+    *lock_web_url(&state) = Some(url.clone());
+    Ok(Some(url))
+}
+
+fn lock_web_url(state: &AppState) -> MutexGuard<'_, Option<String>> {
+    state
+        .web_interface_url
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[tauri::command]
@@ -300,16 +714,18 @@ fn configure_gateway(
 }
 
 #[tauri::command]
-fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
+fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let worker = {
         let mut session = lock_session(&state);
         session.active_room = None;
         session.worker.take()
     };
     if let Some(worker) = worker {
-        worker
+        let result = worker
             .join()
-            .map_err(|_| "Worker thread panicked during shutdown".to_string())?;
+            .map_err(|_| "Worker thread panicked during shutdown".to_string());
+        emit_worker_ui_event(&app, UiEvent::Stopped);
+        result?;
     }
     Ok(())
 }
@@ -404,8 +820,8 @@ fn start_event_pump(app: AppHandle) -> io::Result<()> {
 
                 if dropped_events > last_dropped {
                     last_dropped = dropped_events;
-                    let _ = app.emit(
-                        "worker-event",
+                    emit_worker_ui_event(
+                        &app,
                         UiEvent::DroppedEvents {
                             total: dropped_events,
                         },
@@ -416,10 +832,10 @@ fn start_event_pump(app: AppHandle) -> io::Result<()> {
                     Ok(OscWorkerEvent::Started) => {}
                     Ok(OscWorkerEvent::Stopped) => {
                         stopped_event_seen = true;
-                        let _ = app.emit("worker-event", UiEvent::Stopped);
+                        emit_worker_ui_event(&app, UiEvent::Stopped);
                     }
                     Ok(OscWorkerEvent::MessageSent(bytes)) => {
-                        let _ = app.emit("worker-event", UiEvent::MessageSent { bytes });
+                        emit_worker_ui_event(&app, UiEvent::MessageSent { bytes });
                     }
                     Ok(OscWorkerEvent::MessageReceived(sender, message)) => {
                         let args = message
@@ -430,8 +846,8 @@ fn start_event_pump(app: AppHandle) -> io::Result<()> {
                                 value => format!("{value:?}"),
                             })
                             .collect();
-                        let _ = app.emit(
-                            "worker-event",
+                        emit_worker_ui_event(
+                            &app,
                             UiEvent::MessageReceived {
                                 sender: sender.to_string(),
                                 address: message.address().into_owned(),
@@ -440,8 +856,8 @@ fn start_event_pump(app: AppHandle) -> io::Result<()> {
                         );
                     }
                     Ok(OscWorkerEvent::Error(error)) => {
-                        let _ = app.emit(
-                            "worker-event",
+                        emit_worker_ui_event(
+                            &app,
                             UiEvent::Error {
                                 message: format!("{error:?}"),
                             },
@@ -456,7 +872,7 @@ fn start_event_pump(app: AppHandle) -> io::Result<()> {
                         let _ = worker.join();
                     }
                     if !stopped_event_seen {
-                        let _ = app.emit("worker-event", UiEvent::Stopped);
+                        emit_worker_ui_event(&app, UiEvent::Stopped);
                     }
                     break;
                 }
@@ -598,14 +1014,24 @@ fn emit_gateway_status(
     gateway_uuid: Option<String>,
     detail: Option<String>,
 ) {
-    let _ = app.emit(
-        "gateway-status",
-        GatewayStatus {
-            state: state.to_string(),
-            gateway_uuid,
-            detail,
-        },
-    );
+    let status = GatewayStatus {
+        state: state.to_string(),
+        gateway_uuid,
+        detail,
+    };
+    let _ = app.emit("gateway-status", status.clone());
+    let _ = app
+        .state::<AppState>()
+        .browser_events
+        .send(BrowserEvent::Gateway(status));
+}
+
+fn emit_worker_ui_event(app: &AppHandle, event: UiEvent) {
+    let _ = app.emit("worker-event", event.clone());
+    let _ = app
+        .state::<AppState>()
+        .browser_events
+        .send(BrowserEvent::Worker(event));
 }
 
 fn stop_gateway_runtime(state: &AppState) {
@@ -636,6 +1062,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             connect,
             get_network_interfaces,
             configure_gateway,
+            get_web_interface_url,
+            configure_web_interface,
             disconnect,
             enter_room,
             exit_room,
@@ -649,8 +1077,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = worker.join();
                 }
                 stop_gateway_runtime(&state);
+                stop_web_interface(&state);
             }
         })
         .run(tauri::generate_context!())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_requests_require_local_host_and_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:9140".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://127.0.0.1:9140".parse().unwrap());
+        assert!(is_local_browser_request(&headers, 9140));
+
+        headers.insert(header::ORIGIN, "https://example.com".parse().unwrap());
+        assert!(!is_local_browser_request(&headers, 9140));
+        headers.insert(header::ORIGIN, "http://localhost:9141".parse().unwrap());
+        assert!(!is_local_browser_request(&headers, 9140));
+        headers.insert(header::ORIGIN, "http://localhost:9140".parse().unwrap());
+        headers.insert(header::HOST, "example.com:9140".parse().unwrap());
+        assert!(!is_local_browser_request(&headers, 9140));
+    }
+
+    #[test]
+    fn browser_worker_events_use_frontend_envelope() {
+        let event = BrowserEvent::Worker(UiEvent::MessageSent { bytes: 42 });
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::json!({"event": "worker-event", "payload": {"kind": "message_sent", "bytes": 42}})
+        );
+    }
 }

@@ -7,8 +7,19 @@ edition = "2024"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+axum = { version = "0.8", features = ["ws"] }
 if-addrs = "0.13"
+mime_guess = "2"
 rust_osc_io = { path = "../.." }
 rosc = "0.11.4"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tauri = { version = "2", features = [] }
+tokio = { version = "1", features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+rust-embed = "8"

@@ -1,5 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { listen as tauriListen } from "@tauri-apps/api/event";
 import {
   Activity,
   ArrowDownLeft,
@@ -58,6 +58,7 @@ type Preferences = {
   density: "comfortable" | "compact";
   reduceMotion: boolean;
   autoConnect: boolean;
+  serveWebInterface: boolean;
   gatewayEnabled: boolean;
   gatewayConflictPolicy: "start_anyway" | "stop_local" | "never_start";
   enterToSend: boolean;
@@ -70,7 +71,9 @@ const RECENT_ROOMS_KEY = "oscmessenger.recent-rooms.v1";
 const PREFERENCES_KEY = "oscmessenger.preferences.v1";
 const MAX_RECENT_ROOMS = 20;
 const GLOBAL_PRESENCE_QUERY_ROOM = "__OSCMESSENGER_GLOBAL_PRESENCE__";
-const desktopBridgeAvailable = "__TAURI_INTERNALS__" in window;
+const nativeBridgeAvailable = "__TAURI_INTERNALS__" in window;
+const browserBridgeAvailable = "__OSCMESSENGER_WEB_BRIDGE__" in window;
+const desktopBridgeAvailable = nativeBridgeAvailable || browserBridgeAvailable;
 const DEFAULT_PREFERENCES: Preferences = {
   networkMode: "multicast",
   interfaceMode: "default",
@@ -84,6 +87,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   density: "comfortable",
   reduceMotion: false,
   autoConnect: true,
+  serveWebInterface: true,
   gatewayEnabled: true,
   gatewayConflictPolicy: "stop_local",
   enterToSend: true,
@@ -104,6 +108,51 @@ const RECOMMENDED_ROOMS = [
   { name: "FOH", role: "Front of house" },
   { name: "PRODUCTION", role: "Production" },
 ];
+
+function invoke<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
+  if (nativeBridgeAvailable) return tauriInvoke<T>(command, args);
+  if (!browserBridgeAvailable) return Promise.reject(new Error("Desktop bridge is unavailable."));
+  return fetch(`/api/commands/${encodeURIComponent(command)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(args),
+  }).then(async (response) => {
+    const text = await response.text();
+    let payload: unknown;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = text;
+    }
+    if (!response.ok) {
+      const error = payload && typeof payload === "object" && "error" in payload
+        ? String((payload as { error: unknown }).error)
+        : String(payload || response.statusText);
+      throw new Error(error);
+    }
+    return payload as T;
+  });
+}
+
+function listen<T>(eventName: string, handler: (event: { payload: T }) => void): Promise<() => void> {
+  if (nativeBridgeAvailable) return tauriListen<T>(eventName, handler);
+  if (!browserBridgeAvailable) return Promise.reject(new Error("Desktop bridge is unavailable."));
+  return new Promise((resolve, reject) => {
+    const eventUrl = new URL("/api/events", window.location.href);
+    eventUrl.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(eventUrl);
+    socket.onopen = () => resolve(() => socket.close());
+    socket.onerror = () => reject(new Error("Could not connect to the OSCMessenger event stream."));
+    socket.onmessage = ({ data }) => {
+      try {
+        const event = JSON.parse(String(data)) as { event: string; payload: T };
+        if (event.event === eventName) handler({ payload: event.payload });
+      } catch {
+        // Ignore malformed event frames and keep the stream alive.
+      }
+    };
+  });
+}
 
 function roomRole(roomName: string) {
   return RECOMMENDED_ROOMS.find((room) => room.name === roomName)?.role;
@@ -178,6 +227,7 @@ function loadPreferences(): Preferences {
       density: parsed.density === "compact" ? "compact" : "comfortable",
       reduceMotion: parsed.reduceMotion === true,
       autoConnect: parsed.autoConnect !== false,
+      serveWebInterface: parsed.serveWebInterface !== false,
       gatewayEnabled: parsed.gatewayEnabled !== false,
       gatewayConflictPolicy: parsed.gatewayConflictPolicy === "start_anyway" || parsed.gatewayConflictPolicy === "never_start"
         ? parsed.gatewayConflictPolicy
@@ -238,6 +288,7 @@ export default function App() {
   const [networkInterfaces, setNetworkInterfaces] = useState<LocalNetworkInterface[]>([]);
   const [networkInterfaceError, setNetworkInterfaceError] = useState("");
   const [gatewayStatus, setGatewayStatus] = useState<GatewayUiStatus>({ state: "checking", gateway_uuid: null, detail: null });
+  const [webInterfaceUrl, setWebInterfaceUrl] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsError, setSettingsError] = useState("");
   const [connected, setConnected] = useState(false);
@@ -258,6 +309,7 @@ export default function App() {
   const startupConnectionAttempted = useRef(false);
   const connectInProgress = useRef(false);
   const gatewayStartupConfigured = useRef(false);
+  const webInterfaceChange = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     localStorage.setItem(IDENTITY_KEY, JSON.stringify(identity));
@@ -270,6 +322,24 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(PREFERENCES_KEY, JSON.stringify(preferences));
   }, [preferences]);
+
+  useEffect(() => {
+    if (!desktopBridgeAvailable) return;
+    let active = true;
+    const request = nativeBridgeAvailable
+      ? webInterfaceChange.current.then(() => invoke<string | null>("configure_web_interface", { enabled: preferences.serveWebInterface }))
+      : invoke<string>("get_web_interface_url");
+    if (nativeBridgeAvailable) webInterfaceChange.current = request.then(() => {}, () => {});
+    void request
+      .then((url) => { if (active) setWebInterfaceUrl(url ?? ""); })
+      .catch((error: unknown) => {
+        if (active) {
+          setWebInterfaceUrl("");
+          if (nativeBridgeAvailable) setSettingsError(String(error));
+        }
+      });
+    return () => { active = false; };
+  }, [preferences.serveWebInterface]);
 
   useEffect(() => {
     if (!settingsOpen || !desktopBridgeAvailable || preferences.networkMode !== "multicast") return;
@@ -788,7 +858,7 @@ export default function App() {
         </header>
 
         {settingsOpen && <section className="settings-page">
-          <div className="settings-intro"><button type="button" className="back-settings" onClick={() => setSettingsOpen(false)}><ArrowLeft size={15} /> Back to channel</button><span className="section-label">OSCMESSENGER DESKTOP</span><p>Network, identity, and display preferences for this device.</p></div>
+          <div className="settings-intro"><button type="button" className="back-settings" onClick={() => setSettingsOpen(false)}><ArrowLeft size={15} /> Back to channel</button><span className="section-label">OSCMESSENGER DESKTOP</span><p>Network, identity, and display preferences for this device.</p>{nativeBridgeAvailable && <label className="settings-toggle-row browser-server-toggle"><span className="settings-toggle-copy"><strong>Serve browser interface</strong><small>Available only on this computer.</small></span><input type="checkbox" checked={preferences.serveWebInterface} onChange={(event) => updatePreference("serveWebInterface", event.target.checked)} /><span className="settings-toggle-track" aria-hidden="true" /></label>}{webInterfaceUrl && <div className="web-interface-address"><span>Browser interface</span><code>{webInterfaceUrl}</code></div>}</div>
           <form className="settings-form" onSubmit={saveSettings}>
             <section className="settings-group">
               <div className="settings-group-heading"><span className="settings-index">01</span><div><h2>Identity</h2><p>How this station appears to other clients.</p></div></div>

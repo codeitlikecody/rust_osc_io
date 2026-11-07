@@ -9,6 +9,7 @@ import {
   Hash,
   ArrowLeft,
   Cable,
+  Menu,
   MessageSquareText,
   Radio,
   RadioTower,
@@ -39,6 +40,7 @@ type ChatMessage = {
 type Contact = { id: string; name: string; application: string };
 type LocalNetworkInterface = { name: string; address: string; is_loopback: boolean };
 type GatewayUiStatus = { state: string; gateway_uuid: string | null; detail: string | null };
+type RoomState = { active_room: string | null; revision: number };
 
 type SavedIdentity = {
   clientName: string;
@@ -64,6 +66,10 @@ type Preferences = {
   enterToSend: boolean;
   showTimestamps: boolean;
   showPeerApplications: boolean;
+  showRecentRooms: boolean;
+  recentRoomLimit: number;
+  showRecommendedRooms: boolean;
+  recommendedRoomLimit: number;
 };
 
 const IDENTITY_KEY = "oscmessenger.identity.v1";
@@ -93,6 +99,10 @@ const DEFAULT_PREFERENCES: Preferences = {
   enterToSend: true,
   showTimestamps: true,
   showPeerApplications: true,
+  showRecentRooms: true,
+  recentRoomLimit: MAX_RECENT_ROOMS,
+  showRecommendedRooms: true,
+  recommendedRoomLimit: 12,
 };
 const RECOMMENDED_ROOMS = [
   { name: "LX", role: "Lighting" },
@@ -235,6 +245,14 @@ function loadPreferences(): Preferences {
       enterToSend: parsed.enterToSend !== false,
       showTimestamps: parsed.showTimestamps !== false,
       showPeerApplications: parsed.showPeerApplications !== false,
+      showRecentRooms: parsed.showRecentRooms !== false,
+      recentRoomLimit: typeof parsed.recentRoomLimit === "number" && Number.isInteger(parsed.recentRoomLimit)
+        ? Math.max(1, Math.min(MAX_RECENT_ROOMS, parsed.recentRoomLimit))
+        : DEFAULT_PREFERENCES.recentRoomLimit,
+      showRecommendedRooms: parsed.showRecommendedRooms !== false,
+      recommendedRoomLimit: typeof parsed.recommendedRoomLimit === "number" && Number.isInteger(parsed.recommendedRoomLimit)
+        ? Math.max(1, Math.min(RECOMMENDED_ROOMS.length, parsed.recommendedRoomLimit))
+        : DEFAULT_PREFERENCES.recommendedRoomLimit,
     };
   } catch {
     return DEFAULT_PREFERENCES;
@@ -290,6 +308,7 @@ export default function App() {
   const [gatewayStatus, setGatewayStatus] = useState<GatewayUiStatus>({ state: "checking", gateway_uuid: null, detail: null });
   const [webInterfaceUrl, setWebInterfaceUrl] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const [settingsError, setSettingsError] = useState("");
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -306,10 +325,40 @@ export default function App() {
   const [droppedEvents, setDroppedEvents] = useState(0);
   const [sending, setSending] = useState(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
+  const mobileNavigationButtonRef = useRef<HTMLButtonElement>(null);
+  const mobileNavigationCloseRef = useRef<HTMLButtonElement>(null);
+  const mobileNavigationRef = useRef<HTMLElement>(null);
   const startupConnectionAttempted = useRef(false);
   const connectInProgress = useRef(false);
   const gatewayStartupConfigured = useRef(false);
   const webInterfaceChange = useRef<Promise<void>>(Promise.resolve());
+  const roomRevision = useRef(-1);
+
+  useEffect(() => {
+    if (!mobileNavigationOpen) return;
+    mobileNavigationCloseRef.current?.focus();
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setMobileNavigationOpen(false);
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(mobileNavigationRef.current?.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex='-1'])") ?? [])
+        .filter((element) => element.getClientRects().length > 0);
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !mobileNavigationRef.current?.contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !mobileNavigationRef.current?.contains(document.activeElement))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      mobileNavigationButtonRef.current?.focus();
+    };
+  }, [mobileNavigationOpen]);
 
   useEffect(() => {
     localStorage.setItem(IDENTITY_KEY, JSON.stringify(identity));
@@ -358,6 +407,28 @@ export default function App() {
       active = false;
     };
   }, [settingsOpen, preferences.networkMode]);
+
+  useEffect(() => {
+    if (!desktopBridgeAvailable) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    const applyRoomState = (roomState: RoomState) => {
+      if (!active || roomState.revision <= roomRevision.current) return;
+      roomRevision.current = roomState.revision;
+      setActiveRoom(roomState.active_room);
+      setSendToRoom(false);
+      setSendRoom("");
+      setContacts([]);
+    };
+    void listen<RoomState>("room-state", ({ payload }) => applyRoomState(payload))
+      .then(async (stop) => {
+        if (!active) { stop(); return; }
+        unlisten = stop;
+        applyRoomState(await invoke<RoomState>("get_room_state"));
+      })
+      .catch((error: unknown) => { if (active) setNotice(String(error)); });
+    return () => { active = false; unlisten?.(); };
+  }, []);
 
   useEffect(() => {
     if (!desktopBridgeAvailable) return;
@@ -442,14 +513,22 @@ export default function App() {
         }
       }
     }).then((stop) => {
-      if (active) unlisten = stop;
+      if (active) {
+        unlisten = stop;
+        if (connected) {
+          void invoke("query_listening", {
+            roomName: activeRoom ?? GLOBAL_PRESENCE_QUERY_ROOM,
+            withinRoom: activeRoom !== null,
+          }).catch((error: unknown) => { if (active) setNotice(String(error)); });
+        }
+      }
       else stop();
     }).catch((error: unknown) => setNotice(String(error)));
     return () => {
       active = false;
       unlisten?.();
     };
-  }, [activeRoom, clientUuid]);
+  }, [activeRoom, clientUuid, connected]);
 
   useEffect(() => {
     transcriptRef.current?.scrollTo({
@@ -462,15 +541,17 @@ export default function App() {
   const visibleMessages = messages.filter((message) => message.room === displayRoom);
   const visibleContacts = contacts;
   const roomSearch = roomDraft.trim().toLowerCase();
-  const recentRoomSuggestions = recentRooms
+  const recentRoomSuggestions = (preferences.showRecentRooms ? recentRooms : [])
     .filter((room) => room.toLowerCase().includes(roomSearch))
+    .slice(0, preferences.recentRoomLimit)
     .map((name) => ({
       name,
       role: roomRole(name) ?? "Recent room",
     }));
-  const recentRoomNames = new Set(recentRooms);
-  const recommendedRoomSuggestions = RECOMMENDED_ROOMS.filter((room) =>
-    !recentRoomNames.has(room.name) && room.name.toLowerCase().includes(roomSearch));
+  const recentRoomNames = new Set(recentRoomSuggestions.map((room) => room.name));
+  const recommendedRoomSuggestions = (preferences.showRecommendedRooms ? RECOMMENDED_ROOMS : [])
+    .filter((room) => !recentRoomNames.has(room.name) && room.name.toLowerCase().includes(roomSearch))
+    .slice(0, preferences.recommendedRoomLimit);
 
   function updateIdentity(field: "clientName", value: string) {
     setIdentity((current) => ({ ...current, [field]: value }));
@@ -715,6 +796,8 @@ export default function App() {
     }
     if (activeRoom === room) {
       setRoomDraft("");
+      setMobileNavigationOpen(false);
+      setSettingsOpen(false);
       return;
     }
     try {
@@ -722,13 +805,10 @@ export default function App() {
         await invoke("exit_room", { roomName: activeRoom });
       }
       await invoke("enter_room", { roomName: room });
-      setActiveRoom(room);
-      setSendToRoom(false);
-      setSendRoom("");
       setRoomDraft("");
+      setMobileNavigationOpen(false);
+      setSettingsOpen(false);
       setRecentRooms((current) => [room, ...current.filter((recent) => recent !== room)].slice(0, MAX_RECENT_ROOMS));
-      setContacts([]);
-      await invoke("query_listening", { roomName: room, withinRoom: true });
       setNotice("");
     } catch (error) {
       setNotice(String(error));
@@ -744,9 +824,8 @@ export default function App() {
     if (!activeRoom) return;
     try {
       await invoke("exit_room", { roomName: activeRoom });
-      setActiveRoom(null);
-      setContacts([]);
-      await invoke("query_listening", { roomName: GLOBAL_PRESENCE_QUERY_ROOM, withinRoom: false });
+      setMobileNavigationOpen(false);
+      setSettingsOpen(false);
       setNotice("");
     } catch (error) {
       setNotice(String(error));
@@ -757,6 +836,8 @@ export default function App() {
     setSendToRoom(false);
     setSendRoom("");
     if (activeRoom) await leaveRoom();
+    setMobileNavigationOpen(false);
+    setSettingsOpen(false);
   }
 
   async function sendMessage(event: FormEvent) {
@@ -805,16 +886,18 @@ export default function App() {
 
   return (
     <main className={`app-shell ${connected ? "is-connected" : "is-disconnected"}`} data-theme={preferences.theme} data-accent={preferences.accent} data-density={preferences.density} data-reduce-motion={preferences.reduceMotion}>
-      <aside className="sidebar">
+      {mobileNavigationOpen && <button type="button" className="mobile-navigation-backdrop" aria-label="Close navigation" onClick={() => setMobileNavigationOpen(false)} />}
+      <aside ref={mobileNavigationRef} id="station-navigation" aria-label="Station and channels" role={mobileNavigationOpen ? "dialog" : undefined} aria-modal={mobileNavigationOpen || undefined} className={`sidebar ${mobileNavigationOpen ? "is-mobile-open" : ""}`}>
         <div className="brand-lockup">
           <div className="brand-mark"><AudioLines size={21} strokeWidth={2.2} /></div>
           <div><span className="brand-name">OSC<span>Messenger</span></span><span className="brand-edition">STAGE COMMS / 01</span></div>
+          <button ref={mobileNavigationCloseRef} type="button" className="mobile-navigation-close" aria-label="Close navigation" title="Close navigation" onClick={() => setMobileNavigationOpen(false)}><X size={18} /></button>
         </div>
 
         <div className="connection-block">
           <div className="section-label">YOUR STATION</div>
           <div className="callsign-readout"><span>CALLSIGN</span><strong>{identity.clientName}</strong></div>
-          <button className={`connection-button ${connected ? "is-connected" : ""}`} onClick={connected ? disconnect : connect} disabled={!desktopBridgeAvailable || connecting}>
+          <button className={`connection-button ${connected ? "is-connected" : ""}`} onClick={() => { setMobileNavigationOpen(false); void (connected ? disconnect() : connect()); }} disabled={!desktopBridgeAvailable || connecting}>
             <span className="connection-indicator" />
             {connecting ? "Connecting…" : connected ? "Disconnect" : "Connect to OSC"}
             {connected ? <X size={15} /> : <RadioTower size={15} />}
@@ -841,9 +924,11 @@ export default function App() {
               <div className="recommended-heading">{roomSearch ? "MATCHING ROOMS" : "RECOMMENDED ROOMS"}</div>
               <div className="recommended-grid">{recommendedRoomSuggestions.map(renderRoomSuggestion)}</div>
             </div>}
-            {roomSearch && recentRoomSuggestions.length === 0 && recommendedRoomSuggestions.length === 0 && <div className="no-room-matches">No matching rooms</div>}
+            {roomSearch && (preferences.showRecentRooms || preferences.showRecommendedRooms) && recentRoomSuggestions.length === 0 && recommendedRoomSuggestions.length === 0 && <div className="no-room-matches">No matching rooms</div>}
           </div>
         </div>}
+
+        {connected && <div className="mobile-roster roster-section"><div className="roster-heading"><span>ON CHANNEL</span><span className="roster-count">{visibleContacts.length + 1}</span></div><div className="roster-person"><div className="roster-avatar local">{identity.clientName.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{identity.clientName || "Unnamed station"}</strong><span>YOU</span></div><span className="roster-presence" /></div>{visibleContacts.map((contact) => <div className="roster-person" key={contact.id}><div className="roster-avatar">{contact.name.slice(0, 1).toUpperCase()}</div><div className="roster-copy"><strong>{contact.name}</strong><span>{preferences.showPeerApplications ? contact.application : "ONLINE"}</span></div><span className="roster-presence" /></div>)}</div>}
 
         <div className="sidebar-bottom">
           <div className="network-status"><span className={connected ? "status-led active" : "status-led"} /><span>{connected ? "OSC NETWORK" : "OFFLINE"}</span><span className="mono">UDP</span></div>
@@ -853,8 +938,8 @@ export default function App() {
 
       <section className="main-panel">
         <header className="topbar">
-          <div className="channel-title"><div className="channel-icon">{settingsOpen ? <Settings2 size={18} /> : displayRoom ? <Hash size={18} /> : <Radio size={18} />}</div><div><h1>{settingsOpen ? "Settings" : displayRoom ? formatRoomName(displayRoom) : "Global channel"}</h1><p>{settingsOpen ? "CLIENT PREFERENCES" : activeRoom ? "ROOM TRANSMISSION" : sendToRoom ? "ROOM SEND ONLY" : "OPEN TRANSMISSION"}<span className="title-separator">/</span>{connected ? "LISTENING" : connecting ? "CONNECTING" : "NO SIGNAL"}</p></div></div>
-          <div className="topbar-right"><span className="signal-label"><Activity size={14} /> {connected ? "SIGNAL READY" : connecting ? "CONNECTING" : "NO SIGNAL"}</span><span className="topbar-divider" /><span className="protocol-label">OSC <b>1.0</b></span><button type="button" className="settings-toggle" title={settingsOpen ? "Close settings" : "Settings"} aria-label={settingsOpen ? "Close settings" : "Settings"} onClick={() => { setSettingsOpen(!settingsOpen); setSettingsError(""); }}>{settingsOpen ? <X size={17} /> : <Settings2 size={17} />}</button></div>
+          <div className="topbar-start"><button ref={mobileNavigationButtonRef} type="button" className="mobile-navigation-toggle" aria-label="Open navigation" aria-controls="station-navigation" aria-expanded={mobileNavigationOpen} title="Open navigation" onClick={() => setMobileNavigationOpen(true)}><Menu size={20} /></button><div className="channel-title"><div className="channel-icon">{settingsOpen ? <Settings2 size={18} /> : displayRoom ? <Hash size={18} /> : <Radio size={18} />}</div><div><h1>{settingsOpen ? "Settings" : displayRoom ? formatRoomName(displayRoom) : "Global channel"}</h1><p>{settingsOpen ? "CLIENT PREFERENCES" : activeRoom ? "ROOM TRANSMISSION" : sendToRoom ? "ROOM SEND ONLY" : "OPEN TRANSMISSION"}<span className="title-separator">/</span>{connected ? "LISTENING" : connecting ? "CONNECTING" : "NO SIGNAL"}</p></div></div></div>
+          <div className="topbar-right"><span className="signal-label"><Activity size={14} /> {connected ? "SIGNAL READY" : connecting ? "CONNECTING" : "NO SIGNAL"}</span><span className="topbar-divider" /><span className="protocol-label">OSC <b>1.0</b></span><button type="button" className="settings-toggle" title={settingsOpen ? "Close settings" : "Settings"} aria-label={settingsOpen ? "Close settings" : "Settings"} onClick={() => { setMobileNavigationOpen(false); setSettingsOpen(!settingsOpen); setSettingsError(""); }}>{settingsOpen ? <X size={17} /> : <Settings2 size={17} />}</button></div>
         </header>
 
         {settingsOpen && <section className="settings-page">
@@ -889,7 +974,10 @@ export default function App() {
             </section>
 
             <section className="settings-group">
-              <div className="settings-group-heading"><span className="settings-index">05</span><div><h2>Room history</h2><p>Recently joined rooms are stored on this device.</p></div></div>
+              <div className="settings-group-heading"><span className="settings-index">05</span><div><h2>Rooms</h2><p>Room suggestions and history.</p></div></div>
+              <label className="settings-toggle-row"><span className="settings-toggle-copy"><strong>Show recent rooms</strong><small>Display recently joined rooms in the sidebar.</small></span><input type="checkbox" checked={preferences.showRecentRooms} onChange={(event) => updatePreference("showRecentRooms", event.target.checked)} /><span className="settings-toggle-track" aria-hidden="true" /></label>
+              <label className="settings-toggle-row"><span className="settings-toggle-copy"><strong>Show recommended rooms</strong><small>Display suggested rooms in the sidebar.</small></span><input type="checkbox" checked={preferences.showRecommendedRooms} onChange={(event) => updatePreference("showRecommendedRooms", event.target.checked)} /><span className="settings-toggle-track" aria-hidden="true" /></label>
+              <div className="settings-field-grid"><label className="settings-field"><span>Recent rooms displayed</span><input type="number" min="1" max={MAX_RECENT_ROOMS} step="1" value={preferences.recentRoomLimit} disabled={!preferences.showRecentRooms} onChange={(event) => { const value = event.target.valueAsNumber; if (Number.isInteger(value)) updatePreference("recentRoomLimit", Math.max(1, Math.min(MAX_RECENT_ROOMS, value))); }} /></label><label className="settings-field"><span>Recommended rooms displayed</span><input type="number" min="1" max={RECOMMENDED_ROOMS.length} step="1" value={preferences.recommendedRoomLimit} disabled={!preferences.showRecommendedRooms} onChange={(event) => { const value = event.target.valueAsNumber; if (Number.isInteger(value)) updatePreference("recommendedRoomLimit", Math.max(1, Math.min(RECOMMENDED_ROOMS.length, value))); }} /></label></div>
               <div className="history-clear-row"><div><strong>Recent rooms</strong><small>{recentRooms.length} of {MAX_RECENT_ROOMS} saved</small></div><button type="button" className="reset-network-button" disabled={recentRooms.length === 0} onClick={() => setRecentRooms([])}>Clear recent rooms</button></div>
             </section>
 

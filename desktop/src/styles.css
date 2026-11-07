@@ -697,10 +697,30 @@ textarea:focus-visible {
     background: #171d1acc;
 }
 
+.topbar-start {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    min-width: 0;
+    gap: 10px;
+}
+
+.mobile-navigation-toggle,
+.mobile-navigation-close,
+.mobile-navigation-backdrop,
+.mobile-roster {
+    display: none;
+}
+
 .channel-title {
     display: flex;
+    flex: 1;
     align-items: center;
     gap: 12px;
+    min-width: 0;
+}
+
+.channel-title>div:last-child {
     min-width: 0;
 }
 
@@ -726,9 +746,12 @@ textarea:focus-visible {
 }
 
 .channel-title p {
+    overflow: hidden;
     margin: 5px 0 0;
     color: #718077;
     font: 9px var(--mono);
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .title-separator {
@@ -738,6 +761,7 @@ textarea:focus-visible {
 
 .topbar-right {
     display: flex;
+    flex-shrink: 0;
     align-items: center;
     gap: 14px;
     color: #738078;
@@ -1025,6 +1049,10 @@ textarea:focus-visible {
     border: 1px solid #344037;
     border-radius: 3px;
     font-size: 12px;
+}
+
+.settings-field input:disabled {
+    opacity: 0.5;
 }
 
 .settings-field-grid {
@@ -2074,12 +2102,13 @@ textarea:focus-visible {
 
 @media (max-width: 780px) {
     body {
-        min-width: 360px;
+        min-width: 0;
     }
 
     .app-shell {
         grid-template-columns: 1fr;
-        min-height: 560px;
+        height: 100dvh;
+        min-height: 0;
     }
 
     .app-shell.is-disconnected {
@@ -2090,27 +2119,139 @@ textarea:focus-visible {
         display: none;
     }
 
+    .sidebar.is-mobile-open {
+        display: flex;
+        position: fixed;
+        z-index: 20;
+        inset: 0 auto 0 0;
+        width: min(320px, calc(100vw - 48px));
+        padding-top: max(25px, env(safe-area-inset-top));
+        padding-bottom: max(15px, env(safe-area-inset-bottom));
+        background: #111613;
+        box-shadow: 8px 0 30px #0008;
+    }
+
+    .app-shell[data-theme="light"] .sidebar.is-mobile-open {
+        background: #f7f9f6;
+    }
+
+    .mobile-navigation-backdrop {
+        display: block;
+        position: fixed;
+        z-index: 19;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        padding: 0;
+        background: #000a;
+        border: 0;
+    }
+
+    .mobile-navigation-toggle,
+    .mobile-navigation-close {
+        display: grid;
+        flex: 0 0 40px;
+        place-items: center;
+        width: 40px;
+        height: 40px;
+        padding: 0;
+        color: var(--text);
+        background: transparent;
+        border: 1px solid var(--line);
+        border-radius: 3px;
+        cursor: pointer;
+    }
+
+    .mobile-navigation-close {
+        margin-left: auto;
+    }
+
+    .mobile-roster {
+        display: block;
+    }
+
+    .room-input-wrap {
+        height: 44px;
+    }
+
+    .room-input-wrap button,
+    .room-active button {
+        flex: 0 0 40px;
+        width: 40px;
+        height: 40px;
+    }
+
     .topbar {
         min-height: 68px;
         padding: 0 16px;
+        gap: 8px;
     }
 
     .topbar-right {
         gap: 8px;
     }
 
+    .settings-toggle {
+        flex-basis: 40px;
+        width: 40px;
+        height: 40px;
+    }
+
     .protocol-label,
-    .topbar-divider {
+    .topbar-divider,
+    .signal-label,
+    .channel-icon {
         display: none;
     }
 
     .composer-wrap {
         padding: 12px 13px 11px;
+        padding-bottom: max(11px, env(safe-area-inset-bottom));
+    }
+
+    .composer {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .composer-leading {
+        flex: 1 0 100%;
+        min-width: 0;
+        max-width: 100%;
+        padding: 0 0 6px;
+        border-right: 0;
+        border-bottom: 1px solid #29332c;
+    }
+
+    .composer-leading>span:not(.composer-dot) {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .target-room-input {
+        flex: 1;
+        width: auto;
+    }
+
+    .composer textarea {
+        min-height: 42px;
+    }
+
+    .send-button {
+        flex-basis: 44px;
+        width: 44px;
+        height: 44px;
     }
 
     .composer-hint {
         gap: 8px;
         font-size: 7px;
+    }
+
+    .composer-hint>span:first-child,
+    .composer-hint>span:nth-child(2) {
+        display: none;
     }
 
     .settings-page {

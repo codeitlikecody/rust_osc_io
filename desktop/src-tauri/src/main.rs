@@ -43,6 +43,25 @@ fn application_name() -> String {
 struct Session {
     worker: Option<OscWorkerHandle>,
     active_room: Option<String>,
+    room_revision: u64,
+}
+
+impl Session {
+    fn room_state(&self) -> RoomState {
+        RoomState {
+            active_room: self.active_room.clone(),
+            revision: self.room_revision,
+        }
+    }
+
+    fn set_active_room(&mut self, room: Option<String>) -> Option<RoomState> {
+        if self.active_room == room {
+            return None;
+        }
+        self.active_room = room;
+        self.room_revision += 1;
+        Some(self.room_state())
+    }
 }
 
 struct AppState {
@@ -102,12 +121,20 @@ struct GatewayStatus {
 }
 
 #[derive(Clone, Serialize)]
+struct RoomState {
+    active_room: Option<String>,
+    revision: u64,
+}
+
+#[derive(Clone, Serialize)]
 #[serde(tag = "event", content = "payload")]
 enum BrowserEvent {
     #[serde(rename = "worker-event")]
     Worker(UiEvent),
     #[serde(rename = "gateway-status")]
     Gateway(GatewayStatus),
+    #[serde(rename = "room-state")]
+    Room(RoomState),
 }
 
 #[derive(Serialize)]
@@ -265,13 +292,22 @@ async fn browser_command(
             ))
         }
         "disconnect" => browser_command_result(disconnect(app.clone(), app.state::<AppState>())),
+        "get_room_state" => browser_command_result(Ok(get_room_state(app.state::<AppState>()))),
         "enter_room" => {
             let request: RoomRequest = parse_browser_request(payload)?;
-            browser_command_result(enter_room(app.state::<AppState>(), request.room_name))
+            browser_command_result(enter_room(
+                app.clone(),
+                app.state::<AppState>(),
+                request.room_name,
+            ))
         }
         "exit_room" => {
             let request: RoomRequest = parse_browser_request(payload)?;
-            browser_command_result(exit_room(app.state::<AppState>(), request.room_name))
+            browser_command_result(exit_room(
+                app.clone(),
+                app.state::<AppState>(),
+                request.room_name,
+            ))
         }
         "send_message" => {
             let request: MessageRequest = parse_browser_request(payload)?;
@@ -600,7 +636,9 @@ fn connect(
     let connection_info = ConnectionInfo {
         client_uuid: worker.client_uuid().to_string(),
     };
-    session.active_room = None;
+    if let Some(room_state) = session.set_active_room(None) {
+        emit_room_state(&app, room_state);
+    }
     session.worker = Some(worker);
     drop(session);
 
@@ -717,7 +755,9 @@ fn configure_gateway(
 fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let worker = {
         let mut session = lock_session(&state);
-        session.active_room = None;
+        if let Some(room_state) = session.set_active_room(None) {
+            emit_room_state(&app, room_state);
+        }
         session.worker.take()
     };
     if let Some(worker) = worker {
@@ -731,7 +771,12 @@ fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> 
 }
 
 #[tauri::command]
-fn enter_room(state: State<'_, AppState>, room_name: String) -> Result<(), String> {
+fn get_room_state(state: State<'_, AppState>) -> RoomState {
+    lock_session(&state).room_state()
+}
+
+#[tauri::command]
+fn enter_room(app: AppHandle, state: State<'_, AppState>, room_name: String) -> Result<(), String> {
     let mut session = lock_session(&state);
     let worker = session
         .worker
@@ -740,12 +785,14 @@ fn enter_room(state: State<'_, AppState>, room_name: String) -> Result<(), Strin
     worker
         .enter_room(room_name.clone())
         .map_err(|error| error.to_string())?;
-    session.active_room = Some(room_name);
+    if let Some(room_state) = session.set_active_room(Some(room_name)) {
+        emit_room_state(&app, room_state);
+    }
     Ok(())
 }
 
 #[tauri::command]
-fn exit_room(state: State<'_, AppState>, room_name: String) -> Result<(), String> {
+fn exit_room(app: AppHandle, state: State<'_, AppState>, room_name: String) -> Result<(), String> {
     let mut session = lock_session(&state);
     let worker = session
         .worker
@@ -755,7 +802,9 @@ fn exit_room(state: State<'_, AppState>, room_name: String) -> Result<(), String
         .exit_room(room_name.clone())
         .map_err(|error| error.to_string())?;
     if session.active_room.as_deref() == Some(&room_name) {
-        session.active_room = None;
+        if let Some(room_state) = session.set_active_room(None) {
+            emit_room_state(&app, room_state);
+        }
     }
     Ok(())
 }
@@ -868,7 +917,16 @@ fn start_event_pump(app: AppHandle) -> io::Result<()> {
                 }
 
                 if worker_finished {
-                    if let Some(worker) = lock_session(&app.state::<AppState>()).worker.take() {
+                    let worker = {
+                        let app_state = app.state::<AppState>();
+                        let mut session = lock_session(&app_state);
+                        let worker = session.worker.take();
+                        if let Some(room_state) = session.set_active_room(None) {
+                            emit_room_state(&app, room_state);
+                        }
+                        worker
+                    };
+                    if let Some(worker) = worker {
                         let _ = worker.join();
                     }
                     if !stopped_event_seen {
@@ -1034,6 +1092,14 @@ fn emit_worker_ui_event(app: &AppHandle, event: UiEvent) {
         .send(BrowserEvent::Worker(event));
 }
 
+fn emit_room_state(app: &AppHandle, room_state: RoomState) {
+    let _ = app.emit("room-state", room_state.clone());
+    let _ = app
+        .state::<AppState>()
+        .browser_events
+        .send(BrowserEvent::Room(room_state));
+}
+
 fn stop_gateway_runtime(state: &AppState) {
     let runtime = state
         .gateway
@@ -1065,6 +1131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             get_web_interface_url,
             configure_web_interface,
             disconnect,
+            get_room_state,
             enter_room,
             exit_room,
             send_message,
@@ -1087,6 +1154,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_state_revision_changes_only_when_membership_changes() {
+        let mut session = Session::default();
+        assert_eq!(session.room_state().revision, 0);
+        let joined = session.set_active_room(Some("LX".to_string())).unwrap();
+        assert_eq!(joined.active_room.as_deref(), Some("LX"));
+        assert_eq!(joined.revision, 1);
+        assert!(session.set_active_room(Some("LX".to_string())).is_none());
+        let left = session.set_active_room(None).unwrap();
+        assert_eq!(left.active_room, None);
+        assert_eq!(left.revision, 2);
+        assert_eq!(
+            serde_json::to_value(BrowserEvent::Room(left)).unwrap(),
+            serde_json::json!({"event": "room-state", "payload": {"active_room": null, "revision": 2}})
+        );
+    }
 
     #[test]
     fn browser_requests_require_local_host_and_origin() {

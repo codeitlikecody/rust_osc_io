@@ -1,5 +1,8 @@
-use crate::config;
-use crate::net::{create_receiver_socket, leave_multicast_group, send_osc_message};
+use crate::config::{self, NetworkMode};
+use crate::net::{
+    create_receiver_socket_with_interfaces, create_unicast_receiver_socket, leave_multicast_group,
+    send_osc_message, send_osc_message_from_socket,
+};
 use crate::protocol::{
     Me, Message, MessengerClient, MessengerProtocolError, RoomEnter, RoomExit, RoomListening,
     RoomSay, Say, Who, validate_uuid,
@@ -7,7 +10,7 @@ use crate::protocol::{
 pub use rosc::OscError;
 use rosc::decoder;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self};
@@ -75,6 +78,12 @@ pub struct OscWorkerHandle {
 impl OscWorkerHandle {
     /// Spawns a receiver thread that listens for OSC packets on the given multicast `group` and `port`.
     pub fn spawn(config: config::Config) -> Result<OscWorkerHandle, io::Error> {
+        if config.network_mode == NetworkMode::Unicast && config.unicast_destination.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unicast destination is required for unicast mode",
+            ));
+        }
         if let Some(client_uuid) = config.client_uuid.as_deref() {
             validate_uuid(client_uuid)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -92,7 +101,10 @@ impl OscWorkerHandle {
         let worker_client = client.clone();
         let thread = thread::Builder::new().spawn(move || {
             spawn_osc_worker(
+                config.network_mode,
                 config.multicast_group,
+                config.multicast_interfaces,
+                config.unicast_destination,
                 config.listener_address,
                 config.sender_address,
                 commands_rx,
@@ -292,7 +304,10 @@ fn configured_client(config: &config::Config) -> MessengerClient {
 /// * `commands` - A channel to receive commands from the main thread.
 /// * `events` - A channel to send events to the main thread.
 fn spawn_osc_worker(
+    network_mode: NetworkMode,
     multicast_group: Ipv4Addr,
+    multicast_interfaces: Vec<Ipv4Addr>,
+    unicast_destination: Option<SocketAddrV4>,
     listener_address: SocketAddrV4,
     sender_address: SocketAddrV4,
     commands: mpsc::Receiver<OscCommand>,
@@ -301,8 +316,19 @@ fn spawn_osc_worker(
 ) -> () {
     let mut buffer = [0u8; 65536];
     let mut current_room: Option<String> = None;
-    let destination = SocketAddrV4::new(multicast_group, listener_address.port());
-    let socket = match create_receiver_socket(multicast_group, listener_address) {
+    let destination = match network_mode {
+        NetworkMode::Multicast => SocketAddrV4::new(multicast_group, listener_address.port()),
+        NetworkMode::Unicast => unicast_destination.expect("unicast destination was validated"),
+    };
+    let socket_result = match network_mode {
+        NetworkMode::Multicast => create_receiver_socket_with_interfaces(
+            multicast_group,
+            listener_address,
+            &multicast_interfaces,
+        ),
+        NetworkMode::Unicast => create_unicast_receiver_socket(listener_address),
+    };
+    let socket = match socket_result {
         Ok(socket) => socket,
         Err(error) => {
             eprintln!("WORKER: Failed to create receiver socket: {error}");
@@ -315,8 +341,14 @@ fn spawn_osc_worker(
     // The timeout lets the worker poll commands while waiting for incoming packets.
     if let Err(error) = socket.set_read_timeout(Some(std::time::Duration::from_millis(100))) {
         eprintln!("WORKER: Failed to set read timeout: {error}");
-        leave_multicast_group(&socket, multicast_group, listener_address.ip())
-            .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
+        leave_network(
+            &socket,
+            network_mode,
+            multicast_group,
+            &multicast_interfaces,
+            listener_address.ip(),
+        )
+        .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
         events
             .send(OscWorkerEvent::Error(OscWorkerError::IoError(error)))
             .unwrap_or_else(|e| eprintln!("WORKER: Failed to send error event: {e}"));
@@ -333,18 +365,33 @@ fn spawn_osc_worker(
         match commands.try_recv() {
             Ok(command) => match command {
                 OscCommand::AbortStartup => {
-                    leave_multicast_group(&socket, multicast_group, listener_address.ip())
-                        .unwrap_or_else(|e| {
-                            eprintln!("WORKER: Failed to leave multicast group: {e}")
-                        });
+                    leave_network(
+                        &socket,
+                        network_mode,
+                        multicast_group,
+                        &multicast_interfaces,
+                        listener_address.ip(),
+                    )
+                    .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
                     break;
                 }
                 OscCommand::Stop => {
-                    send_farewell(destination, sender_address, &client, &events);
-                    leave_multicast_group(&socket, multicast_group, listener_address.ip())
-                        .unwrap_or_else(|e| {
-                            eprintln!("WORKER: Failed to leave multicast group: {e}")
-                        });
+                    send_farewell(
+                        &socket,
+                        network_mode,
+                        destination,
+                        sender_address,
+                        &client,
+                        &events,
+                    );
+                    leave_network(
+                        &socket,
+                        network_mode,
+                        multicast_group,
+                        &multicast_interfaces,
+                        listener_address.ip(),
+                    )
+                    .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
                     notify_stopped(&events);
                     break;
                 }
@@ -358,7 +405,13 @@ fn spawn_osc_worker(
                         }
                         _ => None,
                     };
-                    match send_osc_message(destination, sender_address, message) {
+                    match send_worker_message(
+                        &socket,
+                        network_mode,
+                        destination,
+                        sender_address,
+                        message,
+                    ) {
                         Ok(bytes_sent) => {
                             if let Some((room_name, entering)) = room_transition {
                                 update_current_room(&mut current_room, &room_name, entering);
@@ -382,9 +435,22 @@ fn spawn_osc_worker(
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 // The main thread has disconnected, stop the receiver
-                send_farewell(destination, sender_address, &client, &events);
-                leave_multicast_group(&socket, multicast_group, listener_address.ip())
-                    .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
+                send_farewell(
+                    &socket,
+                    network_mode,
+                    destination,
+                    sender_address,
+                    &client,
+                    &events,
+                );
+                leave_network(
+                    &socket,
+                    network_mode,
+                    multicast_group,
+                    &multicast_interfaces,
+                    listener_address.ip(),
+                )
+                .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
                 events
                     .send(OscWorkerEvent::Error(OscWorkerError::IoError(
                         io::Error::new(io::ErrorKind::ConnectionReset, "Main thread disconnected"),
@@ -411,7 +477,20 @@ fn spawn_osc_worker(
                                     });
                         }
                         if let Some(response) = response {
-                            match send_osc_message(destination, sender_address, response) {
+                            let response_destination = match network_mode {
+                                NetworkMode::Multicast => destination,
+                                NetworkMode::Unicast => match sender {
+                                    SocketAddr::V4(address) => address,
+                                    SocketAddr::V6(_) => continue,
+                                },
+                            };
+                            match send_worker_message(
+                                &socket,
+                                network_mode,
+                                response_destination,
+                                sender_address,
+                                response,
+                            ) {
                                 Ok(bytes_sent) => {
                                     events
                                         .send(OscWorkerEvent::MessageSent(bytes_sent))
@@ -462,9 +541,22 @@ fn spawn_osc_worker(
                 events
                     .send(OscWorkerEvent::Error(OscWorkerError::IoError(error)))
                     .unwrap_or_else(|e| eprintln!("WORKER: Failed to send error event: {e}"));
-                send_farewell(destination, sender_address, &client, &events);
-                leave_multicast_group(&socket, multicast_group, listener_address.ip())
-                    .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
+                send_farewell(
+                    &socket,
+                    network_mode,
+                    destination,
+                    sender_address,
+                    &client,
+                    &events,
+                );
+                leave_network(
+                    &socket,
+                    network_mode,
+                    multicast_group,
+                    &multicast_interfaces,
+                    listener_address.ip(),
+                )
+                .unwrap_or_else(|e| eprintln!("WORKER: Failed to leave multicast group: {e}"));
                 notify_stopped(&events);
                 break;
             }
@@ -479,12 +571,16 @@ fn notify_stopped(events: &WorkerEventSender) {
 }
 
 fn send_farewell(
+    socket: &UdpSocket,
+    network_mode: NetworkMode,
     destination: SocketAddrV4,
     sender_address: SocketAddrV4,
     client: &MessengerClient,
     events: &WorkerEventSender,
 ) {
-    match send_osc_message(
+    match send_worker_message(
+        socket,
+        network_mode,
         destination,
         sender_address,
         Message::Me(Me::Farewell(client.clone())),
@@ -496,6 +592,38 @@ fn send_farewell(
             .send(OscWorkerEvent::Error(error))
             .unwrap_or_else(|e| eprintln!("WORKER: Failed to send error event: {e}")),
     }
+}
+
+fn send_worker_message(
+    socket: &UdpSocket,
+    network_mode: NetworkMode,
+    destination: SocketAddrV4,
+    sender_address: SocketAddrV4,
+    message: Message,
+) -> Result<usize, OscWorkerError> {
+    match network_mode {
+        NetworkMode::Multicast => send_osc_message(destination, sender_address, message),
+        NetworkMode::Unicast => send_osc_message_from_socket(socket, destination, message),
+    }
+}
+
+fn leave_network(
+    socket: &UdpSocket,
+    network_mode: NetworkMode,
+    multicast_group: Ipv4Addr,
+    multicast_interfaces: &[Ipv4Addr],
+    interface: &Ipv4Addr,
+) -> Result<(), io::Error> {
+    if network_mode == NetworkMode::Multicast {
+        if multicast_interfaces.is_empty() {
+            leave_multicast_group(socket, multicast_group, interface)?;
+        } else {
+            for multicast_interface in multicast_interfaces {
+                leave_multicast_group(socket, multicast_group, multicast_interface)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn response_to(

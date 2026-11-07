@@ -8,6 +8,7 @@ import {
   DoorOpen,
   Hash,
   ArrowLeft,
+  Cable,
   MessageSquareText,
   Radio,
   RadioTower,
@@ -36,6 +37,7 @@ type ChatMessage = {
 };
 
 type Contact = { id: string; name: string; application: string };
+type LocalNetworkInterface = { name: string; address: string; is_loopback: boolean };
 
 type SavedIdentity = {
   clientName: string;
@@ -43,10 +45,17 @@ type SavedIdentity = {
 };
 
 type Preferences = {
+  networkMode: "multicast" | "unicast";
+  interfaceMode: "default" | "all" | "selected";
+  multicastInterfaces: string[];
   multicastGroup: string;
   listenerPort: string;
+  unicastAddress: string;
+  unicastPort: string;
   theme: "dark" | "light";
   accent: "lime" | "cyan" | "amber" | "rose";
+  density: "comfortable" | "compact";
+  reduceMotion: boolean;
   autoConnect: boolean;
   enterToSend: boolean;
   showTimestamps: boolean;
@@ -60,10 +69,17 @@ const MAX_RECENT_ROOMS = 20;
 const GLOBAL_PRESENCE_QUERY_ROOM = "__OSCMESSENGER_GLOBAL_PRESENCE__";
 const desktopBridgeAvailable = "__TAURI_INTERNALS__" in window;
 const DEFAULT_PREFERENCES: Preferences = {
+  networkMode: "multicast",
+  interfaceMode: "default",
+  multicastInterfaces: [],
   multicastGroup: "239.254.0.1",
   listenerPort: "3090",
+  unicastAddress: "127.0.0.1",
+  unicastPort: "3090",
   theme: "dark",
   accent: "lime",
+  density: "comfortable",
+  reduceMotion: false,
   autoConnect: true,
   enterToSend: true,
   showTimestamps: true,
@@ -143,10 +159,19 @@ function loadPreferences(): Preferences {
     if (!saved) return DEFAULT_PREFERENCES;
     const parsed = JSON.parse(saved) as Partial<Preferences>;
     return {
+      networkMode: parsed.networkMode === "unicast" ? "unicast" : "multicast",
+      interfaceMode: parsed.interfaceMode === "all" || parsed.interfaceMode === "selected" ? parsed.interfaceMode : "default",
+      multicastInterfaces: Array.isArray(parsed.multicastInterfaces)
+        ? parsed.multicastInterfaces.filter((address): address is string => typeof address === "string")
+        : [],
       multicastGroup: typeof parsed.multicastGroup === "string" ? parsed.multicastGroup : DEFAULT_PREFERENCES.multicastGroup,
       listenerPort: typeof parsed.listenerPort === "string" ? parsed.listenerPort : DEFAULT_PREFERENCES.listenerPort,
+      unicastAddress: typeof parsed.unicastAddress === "string" ? parsed.unicastAddress : DEFAULT_PREFERENCES.unicastAddress,
+      unicastPort: typeof parsed.unicastPort === "string" ? parsed.unicastPort : DEFAULT_PREFERENCES.unicastPort,
       theme: parsed.theme === "light" ? "light" : "dark",
       accent: parsed.accent === "cyan" || parsed.accent === "amber" || parsed.accent === "rose" ? parsed.accent : "lime",
+      density: parsed.density === "compact" ? "compact" : "comfortable",
+      reduceMotion: parsed.reduceMotion === true,
       autoConnect: parsed.autoConnect !== false,
       enterToSend: parsed.enterToSend !== false,
       showTimestamps: parsed.showTimestamps !== false,
@@ -172,6 +197,12 @@ function isValidMulticastIpv4(value: string) {
   return firstOctet >= 224 && firstOctet <= 239;
 }
 
+function isValidUnicastIpv4(value: string) {
+  if (!isValidIpv4(value)) return false;
+  const firstOctet = Number(value.trim().split(".")[0]);
+  return firstOctet > 0 && firstOctet < 224;
+}
+
 function roomFromAddress(address: string) {
   const prefix = "/messenger/me/room/";
   const suffix = "/say";
@@ -195,6 +226,8 @@ function formatTime(timestamp: number) {
 export default function App() {
   const [identity, setIdentity] = useState(loadIdentity);
   const [preferences, setPreferences] = useState(loadPreferences);
+  const [networkInterfaces, setNetworkInterfaces] = useState<LocalNetworkInterface[]>([]);
+  const [networkInterfaceError, setNetworkInterfaceError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsError, setSettingsError] = useState("");
   const [connected, setConnected] = useState(false);
@@ -226,6 +259,24 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(PREFERENCES_KEY, JSON.stringify(preferences));
   }, [preferences]);
+
+  useEffect(() => {
+    if (!settingsOpen || !desktopBridgeAvailable || preferences.networkMode !== "multicast") return;
+    let active = true;
+    void invoke<LocalNetworkInterface[]>("get_network_interfaces")
+      .then((interfaces) => {
+        if (active) {
+          setNetworkInterfaces(interfaces);
+          setNetworkInterfaceError("");
+        }
+      })
+      .catch((error: unknown) => {
+        if (active) setNetworkInterfaceError(String(error));
+      });
+    return () => {
+      active = false;
+    };
+  }, [settingsOpen, preferences.networkMode]);
 
   useEffect(() => {
     if (!desktopBridgeAvailable) return;
@@ -302,8 +353,11 @@ export default function App() {
   }, [activeRoom, clientUuid]);
 
   useEffect(() => {
-    transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages, activeRoom]);
+    transcriptRef.current?.scrollTo({
+      top: transcriptRef.current.scrollHeight,
+      behavior: preferences.reduceMotion ? "auto" : "smooth",
+    });
+  }, [messages, activeRoom, preferences.reduceMotion]);
 
   const displayRoom = activeRoom ?? (sendToRoom ? sendRoom.trim() || null : null);
   const visibleMessages = messages.filter((message) => message.room === displayRoom);
@@ -327,6 +381,30 @@ export default function App() {
     setPreferences((current) => ({ ...current, [key]: value }));
   }
 
+  function resetNetworkSettings() {
+    setPreferences((current) => ({
+      ...current,
+      networkMode: DEFAULT_PREFERENCES.networkMode,
+      interfaceMode: DEFAULT_PREFERENCES.interfaceMode,
+      multicastInterfaces: DEFAULT_PREFERENCES.multicastInterfaces,
+      multicastGroup: DEFAULT_PREFERENCES.multicastGroup,
+      listenerPort: DEFAULT_PREFERENCES.listenerPort,
+      unicastAddress: DEFAULT_PREFERENCES.unicastAddress,
+      unicastPort: DEFAULT_PREFERENCES.unicastPort,
+    }));
+    setSettingsError("");
+  }
+
+  async function multicastInterfaceAddressesFor(settings: Preferences) {
+    if (settings.networkMode !== "multicast" || settings.interfaceMode === "default") return [];
+    if (settings.interfaceMode === "selected") return settings.multicastInterfaces;
+    const interfaces = networkInterfaces.length > 0
+      ? networkInterfaces
+      : await invoke<LocalNetworkInterface[]>("get_network_interfaces");
+    if (interfaces.length === 0) throw new Error("No IPv4 network interfaces are available.");
+    return interfaces.map((networkInterface) => networkInterface.address);
+  }
+
   async function connect() {
     if (!desktopBridgeAvailable || connected || connectInProgress.current) return;
     if (!identity.clientName.trim()) {
@@ -337,15 +415,30 @@ export default function App() {
     setConnecting(true);
     setNotice("");
     try {
-      const port = Number(preferences.listenerPort);
-      if (!isValidMulticastIpv4(preferences.multicastGroup) || !Number.isInteger(port) || port < 1 || port > 65535) {
-        throw new Error("Enter an IPv4 multicast address (224–239 range) and port (1–65535).");
+      const listenerPort = Number(preferences.listenerPort);
+      const unicastPort = Number(preferences.unicastPort);
+      if (!Number.isInteger(listenerPort) || listenerPort < 1 || listenerPort > 65535) {
+        throw new Error("Local listener port must be between 1 and 65535.");
       }
+      if (preferences.networkMode === "multicast" && !isValidMulticastIpv4(preferences.multicastGroup)) {
+        throw new Error("Enter an IPv4 multicast address in the 224–239 range.");
+      }
+      if (preferences.networkMode === "unicast" && (!isValidUnicastIpv4(preferences.unicastAddress) || !Number.isInteger(unicastPort) || unicastPort < 1 || unicastPort > 65535)) {
+        throw new Error("Enter a unicast IPv4 address and destination port (1–65535).");
+      }
+      if (preferences.networkMode === "multicast" && preferences.interfaceMode === "selected" && preferences.multicastInterfaces.length === 0) {
+        throw new Error("Choose at least one network interface.");
+      }
+      const multicastInterfaces = await multicastInterfaceAddressesFor(preferences);
       const result = await invoke<{ client_uuid: string }>("connect", {
         clientName: identity.clientName.trim(),
         clientUuid: identity.clientUuid,
+        networkMode: preferences.networkMode,
         multicastGroup: preferences.multicastGroup.trim(),
-        listenerPort: port,
+        multicastInterfaces,
+        listenerPort,
+        unicastAddress: preferences.unicastAddress.trim(),
+        unicastPort,
       });
       setClientUuid(result.client_uuid);
       setIdentity((current) => ({ ...current, clientUuid: result.client_uuid }));
@@ -384,27 +477,47 @@ export default function App() {
     setSettingsError("");
     const multicastGroup = preferences.multicastGroup.trim();
     const listenerPort = preferences.listenerPort.trim();
-    const port = Number(listenerPort);
+    const unicastAddress = preferences.unicastAddress.trim();
+    const unicastPort = preferences.unicastPort.trim();
+    const listenerPortNumber = Number(listenerPort);
+    const unicastPortNumber = Number(unicastPort);
     const clientName = identity.clientName.trim();
 
     if (!clientName) {
       setSettingsError("Callsign cannot be empty.");
       return;
     }
-    if (!isValidMulticastIpv4(multicastGroup)) {
+    if (preferences.networkMode === "multicast" && !isValidMulticastIpv4(multicastGroup)) {
       setSettingsError("Enter an IPv4 multicast address in the 224.0.0.0–239.255.255.255 range.");
       return;
     }
-    if (!/^\d+$/.test(listenerPort) || !Number.isInteger(port) || port < 1 || port > 65535) {
-      setSettingsError("Port must be a whole number between 1 and 65535.");
+    if (preferences.networkMode === "unicast" && !isValidUnicastIpv4(unicastAddress)) {
+      setSettingsError("Enter a unicast IPv4 address for the target device or gateway.");
+      return;
+    }
+    if (!/^\d+$/.test(listenerPort) || !Number.isInteger(listenerPortNumber) || listenerPortNumber < 1 || listenerPortNumber > 65535) {
+      setSettingsError("Local listener port must be a whole number between 1 and 65535.");
+      return;
+    }
+    if (preferences.networkMode === "unicast" && (!/^\d+$/.test(unicastPort) || !Number.isInteger(unicastPortNumber) || unicastPortNumber < 1 || unicastPortNumber > 65535)) {
+      setSettingsError("Unicast destination port must be a whole number between 1 and 65535.");
+      return;
+    }
+    if (preferences.networkMode === "multicast" && preferences.interfaceMode === "selected" && preferences.multicastInterfaces.length === 0) {
+      setSettingsError("Choose at least one network interface.");
       return;
     }
 
-    const nextPreferences = { ...preferences, multicastGroup, listenerPort };
+    const nextPreferences = { ...preferences, multicastGroup, listenerPort, unicastAddress, unicastPort };
     const nextIdentity = { ...identity, clientName };
     const reconnect = connected && (
+      nextPreferences.networkMode !== preferences.networkMode ||
+      nextPreferences.interfaceMode !== preferences.interfaceMode ||
+      nextPreferences.multicastInterfaces.join(",") !== preferences.multicastInterfaces.join(",") ||
       nextPreferences.multicastGroup !== preferences.multicastGroup ||
       nextPreferences.listenerPort !== preferences.listenerPort ||
+      nextPreferences.unicastAddress !== preferences.unicastAddress ||
+      nextPreferences.unicastPort !== preferences.unicastPort ||
       nextIdentity.clientName !== identity.clientName
     );
 
@@ -416,6 +529,7 @@ export default function App() {
     connectInProgress.current = true;
     setConnecting(true);
     try {
+      const multicastInterfaces = await multicastInterfaceAddressesFor(nextPreferences);
       await invoke("disconnect");
       setConnected(false);
       setActiveRoom(null);
@@ -423,8 +537,12 @@ export default function App() {
       const result = await invoke<{ client_uuid: string }>("connect", {
         clientName: nextIdentity.clientName,
         clientUuid: nextIdentity.clientUuid,
+        networkMode: nextPreferences.networkMode,
         multicastGroup: nextPreferences.multicastGroup,
-        listenerPort: port,
+        multicastInterfaces,
+        listenerPort: listenerPortNumber,
+        unicastAddress: nextPreferences.unicastAddress,
+        unicastPort: unicastPortNumber,
       });
       setClientUuid(result.client_uuid);
       setIdentity({ ...nextIdentity, clientUuid: result.client_uuid });
@@ -541,7 +659,7 @@ export default function App() {
   }
 
   return (
-    <main className={`app-shell ${connected ? "is-connected" : "is-disconnected"}`} data-theme={preferences.theme} data-accent={preferences.accent}>
+    <main className={`app-shell ${connected ? "is-connected" : "is-disconnected"}`} data-theme={preferences.theme} data-accent={preferences.accent} data-density={preferences.density} data-reduce-motion={preferences.reduceMotion}>
       <aside className="sidebar">
         <div className="brand-lockup">
           <div className="brand-mark"><AudioLines size={21} strokeWidth={2.2} /></div>
@@ -556,7 +674,7 @@ export default function App() {
             {connecting ? "Connecting…" : connected ? "Disconnect" : "Connect to OSC"}
             {connected ? <X size={15} /> : <RadioTower size={15} />}
           </button>
-          <div className="connection-meta"><span>{connected ? "MULTICAST LINK ACTIVE" : connecting ? "CONNECTING TO OSC" : desktopBridgeAvailable ? "LINK STANDBY" : "NATIVE CLIENT REQUIRED"}</span><span className="mono">{preferences.multicastGroup} : {preferences.listenerPort}</span></div>
+          <div className="connection-meta"><span>{connected ? `${preferences.networkMode.toUpperCase()} LINK ACTIVE` : connecting ? "CONNECTING TO OSC" : desktopBridgeAvailable ? "LINK STANDBY" : "NATIVE CLIENT REQUIRED"}</span><span className="mono">{preferences.networkMode === "multicast" ? preferences.multicastGroup : `${preferences.unicastAddress}:${preferences.unicastPort}`} : {preferences.listenerPort}</span></div>
         </div>
 
         {connected && <div className="channels-block">
@@ -603,24 +721,43 @@ export default function App() {
             </section>
 
             <section className="settings-group">
-              <div className="settings-group-heading"><span className="settings-index">02</span><div><h2>Network</h2><p>Multicast destination and local listener port.</p></div></div>
-              <div className="settings-field-grid"><label className="settings-field"><span>Multicast IPv4 address</span><input value={preferences.multicastGroup} onChange={(event) => updatePreference("multicastGroup", event.target.value)} inputMode="decimal" spellCheck={false} placeholder="239.254.0.1" /></label><label className="settings-field port-field"><span>UDP port</span><input type="number" min="1" max="65535" step="1" value={preferences.listenerPort} onChange={(event) => updatePreference("listenerPort", event.target.value)} /></label></div>
-              <p className="settings-note">Network or callsign changes reconnect the client when saved.</p>
-            </section>
-
-            <section className="settings-group">
-              <div className="settings-group-heading"><span className="settings-index">03</span><div><h2>Appearance</h2><p>Theme and interface accent.</p></div></div>
+              <div className="settings-group-heading"><span className="settings-index">02</span><div><h2>Appearance</h2><p>Theme and interface accent.</p></div></div>
               <div className="settings-option-block"><span className="settings-option-label">Theme</span><div className="segmented-control"><button type="button" aria-pressed={preferences.theme === "dark"} onClick={() => updatePreference("theme", "dark")}><Moon size={15} /> Dark</button><button type="button" aria-pressed={preferences.theme === "light"} onClick={() => updatePreference("theme", "light")}><Sun size={15} /> Light</button></div></div>
               <div className="settings-option-block"><span className="settings-option-label">Accent color</span><div className="accent-options">{(["lime", "cyan", "amber", "rose"] as const).map((accent) => <button type="button" key={accent} className={`accent-choice accent-${accent} ${preferences.accent === accent ? "selected" : ""}`} aria-label={`${accent} accent`} aria-pressed={preferences.accent === accent} onClick={() => updatePreference("accent", accent)} title={`${accent[0].toUpperCase()}${accent.slice(1)}`}><span /></button>)}</div></div>
+              <div className="settings-option-block"><span className="settings-option-label">Interface density</span><div className="segmented-control"><button type="button" aria-pressed={preferences.density === "comfortable"} onClick={() => updatePreference("density", "comfortable")}>Comfortable</button><button type="button" aria-pressed={preferences.density === "compact"} onClick={() => updatePreference("density", "compact")}>Compact</button></div></div>
             </section>
 
             <section className="settings-group">
-              <div className="settings-group-heading"><span className="settings-index">04</span><div><h2>Behavior</h2><p>Connection and chat preferences.</p></div></div>
-              <label className="settings-toggle"><span><strong>Connect on launch</strong><small>Attempt the OSC connection automatically when the desktop app starts.</small></span><input type="checkbox" checked={preferences.autoConnect} onChange={(event) => updatePreference("autoConnect", event.target.checked)} /><i /></label>
-              <label className="settings-toggle"><span><strong>Enter sends message</strong><small>Use Shift+Enter to insert a new line.</small></span><input type="checkbox" checked={preferences.enterToSend} onChange={(event) => updatePreference("enterToSend", event.target.checked)} /><i /></label>
-              <label className="settings-toggle"><span><strong>Show timestamps</strong><small>Display local receive time on each message.</small></span><input type="checkbox" checked={preferences.showTimestamps} onChange={(event) => updatePreference("showTimestamps", event.target.checked)} /><i /></label>
-              <label className="settings-toggle"><span><strong>Show peer applications</strong><small>Show the application name advertised by other stations.</small></span><input type="checkbox" checked={preferences.showPeerApplications} onChange={(event) => updatePreference("showPeerApplications", event.target.checked)} /><i /></label>
+              <div className="settings-group-heading"><span className="settings-index">03</span><div><h2>Behavior</h2><p>Connection and chat preferences.</p></div></div>
+              <label className="settings-toggle-row"><span className="settings-toggle-copy"><strong>Connect on launch</strong><small>Attempt the OSC connection automatically when the desktop app starts.</small></span><input type="checkbox" checked={preferences.autoConnect} onChange={(event) => updatePreference("autoConnect", event.target.checked)} /><span className="settings-toggle-track" aria-hidden="true" /></label>
+              <label className="settings-toggle-row"><span className="settings-toggle-copy"><strong>Enter sends message</strong><small>Use Shift+Enter to insert a new line.</small></span><input type="checkbox" checked={preferences.enterToSend} onChange={(event) => updatePreference("enterToSend", event.target.checked)} /><span className="settings-toggle-track" aria-hidden="true" /></label>
+              <label className="settings-toggle-row"><span className="settings-toggle-copy"><strong>Show timestamps</strong><small>Display local receive time on each message.</small></span><input type="checkbox" checked={preferences.showTimestamps} onChange={(event) => updatePreference("showTimestamps", event.target.checked)} /><span className="settings-toggle-track" aria-hidden="true" /></label>
+              <label className="settings-toggle-row"><span className="settings-toggle-copy"><strong>Show peer applications</strong><small>Show the application name advertised by other stations.</small></span><input type="checkbox" checked={preferences.showPeerApplications} onChange={(event) => updatePreference("showPeerApplications", event.target.checked)} /><span className="settings-toggle-track" aria-hidden="true" /></label>
+              <label className="settings-toggle-row"><span className="settings-toggle-copy"><strong>Reduce motion</strong><small>Limit interface animations and smooth scrolling.</small></span><input type="checkbox" checked={preferences.reduceMotion} onChange={(event) => updatePreference("reduceMotion", event.target.checked)} /><span className="settings-toggle-track" aria-hidden="true" /></label>
             </section>
+
+            <section className="settings-group">
+              <div className="settings-group-heading"><span className="settings-index">04</span><div><h2>Room history</h2><p>Recently joined rooms are stored on this device.</p></div></div>
+              <div className="history-clear-row"><div><strong>Recent rooms</strong><small>{recentRooms.length} of {MAX_RECENT_ROOMS} saved</small></div><button type="button" className="reset-network-button" disabled={recentRooms.length === 0} onClick={() => setRecentRooms([])}>Clear recent rooms</button></div>
+            </section>
+
+            <details className="settings-group advanced-network-settings">
+              <summary className="settings-group-heading"><span className="settings-index">05</span><div><h2>Advanced settings</h2><p>Only change network settings if you understand your setup.</p></div></summary>
+              <div className="advanced-settings-content">
+                <p className="advanced-warning">Only change these settings if you understand your network setup. Incorrect values can prevent the client from connecting.</p>
+                <div className="settings-option-block transport-choice"><span className="settings-option-label">Connection mode</span><div className="segmented-control"><button type="button" aria-pressed={preferences.networkMode === "multicast"} onClick={() => updatePreference("networkMode", "multicast")}><RadioTower size={15} /> Multicast</button><button type="button" aria-pressed={preferences.networkMode === "unicast"} onClick={() => updatePreference("networkMode", "unicast")}><Cable size={15} /> Unicast</button></div></div>
+                {preferences.networkMode === "multicast" ? <>
+                  <div className="settings-field-grid"><label className="settings-field"><span>Multicast group IPv4</span><input value={preferences.multicastGroup} onChange={(event) => updatePreference("multicastGroup", event.target.value)} inputMode="decimal" spellCheck={false} placeholder="239.254.0.1" /></label><label className="settings-field port-field"><span>Local listener port</span><input type="number" min="1" max="65535" step="1" value={preferences.listenerPort} onChange={(event) => updatePreference("listenerPort", event.target.value)} /></label></div>
+                  <div className="interface-selection">
+                    <div className="settings-option-block"><span className="settings-option-label">Receive interfaces</span><div className="segmented-control interface-mode-control"><button type="button" aria-pressed={preferences.interfaceMode === "default"} onClick={() => updatePreference("interfaceMode", "default")}>Any / default</button><button type="button" aria-pressed={preferences.interfaceMode === "all"} onClick={() => updatePreference("interfaceMode", "all")}>All</button><button type="button" aria-pressed={preferences.interfaceMode === "selected"} onClick={() => updatePreference("interfaceMode", "selected")}>Choose</button></div></div>
+                    {preferences.interfaceMode === "default" && <p className="settings-note">Use the operating system’s default multicast interface.</p>}
+                    {preferences.interfaceMode === "all" && <p className="settings-note">Join the multicast group on every detected IPv4 interface.</p>}
+                    {preferences.interfaceMode === "selected" && <div className="interface-list">{networkInterfaces.map((networkInterface) => <label className="interface-option" key={`${networkInterface.name}-${networkInterface.address}`}><input type="checkbox" checked={preferences.multicastInterfaces.includes(networkInterface.address)} onChange={(event) => updatePreference("multicastInterfaces", event.target.checked ? [...new Set([...preferences.multicastInterfaces, networkInterface.address])] : preferences.multicastInterfaces.filter((address) => address !== networkInterface.address))} /><span><strong>{networkInterface.name}</strong><small>{networkInterface.address}{networkInterface.is_loopback ? " · loopback" : ""}</small></span></label>)}{networkInterfaces.length === 0 && <p className="settings-note">{!desktopBridgeAvailable ? "Open the native desktop client to enumerate local interfaces." : networkInterfaceError || "No local IPv4 interfaces found."}</p>}</div>}
+                  </div>
+                </> : <div className="settings-field-grid unicast-fields"><label className="settings-field"><span>Target device / gateway IPv4</span><input value={preferences.unicastAddress} onChange={(event) => updatePreference("unicastAddress", event.target.value)} inputMode="decimal" spellCheck={false} placeholder="192.168.1.50" /></label><label className="settings-field port-field"><span>Target UDP port</span><input type="number" min="1" max="65535" step="1" value={preferences.unicastPort} onChange={(event) => updatePreference("unicastPort", event.target.value)} /></label><label className="settings-field listener-field"><span>Local listener port</span><input type="number" min="1" max="65535" step="1" value={preferences.listenerPort} onChange={(event) => updatePreference("listenerPort", event.target.value)} /></label></div>}
+                <div className="advanced-network-actions"><span>Network changes reconnect when saved.</span><button type="button" className="reset-network-button" onClick={resetNetworkSettings}>Reset to OSCMessenger defaults</button></div>
+              </div>
+            </details>
 
             {settingsError && <div className="settings-error" role="alert">{settingsError}</div>}
             <div className="settings-actions"><span>Preferences are saved on this device.</span><button type="submit" className="save-settings-button">Save settings</button></div>
@@ -679,7 +816,7 @@ export default function App() {
           {!connected && <div className="roster-empty"><UsersRound size={17} /><span>No stations connected</span></div>}
           {connected && visibleContacts.length === 0 && <div className="roster-empty"><UsersRound size={17} /><span>Only you, for now</span></div>}
         </div>
-        <div className="transport-section"><div className="section-label">TRANSPORT</div><div className="transport-row"><span>Protocol</span><strong>OSC over UDP</strong></div><div className="transport-row"><span>Multicast group</span><strong className="mono">{preferences.multicastGroup}</strong></div><div className="transport-row"><span>Port</span><strong className="mono">{preferences.listenerPort}</strong></div><div className="transport-row"><span>Client ID</span><strong className="mono">{clientUuid.slice(0, 8)}</strong></div></div>
+        <div className="transport-section"><div className="section-label">TRANSPORT</div><div className="transport-row"><span>Mode</span><strong>{preferences.networkMode.toUpperCase()}</strong></div><div className="transport-row"><span>{preferences.networkMode === "multicast" ? "Group" : "Remote endpoint"}</span><strong className="mono">{preferences.networkMode === "multicast" ? preferences.multicastGroup : `${preferences.unicastAddress}:${preferences.unicastPort}`}</strong></div><div className="transport-row"><span>Local port</span><strong className="mono">{preferences.listenerPort}</strong></div><div className="transport-row"><span>Client ID</span><strong className="mono">{clientUuid.slice(0, 8)}</strong></div></div>
         <div className="details-footer"><DoorOpen size={14} /><span>{sendToRoom && !activeRoom ? "DIRECT ROOM SEND DOES NOT JOIN THE ROOM" : "ROOM MEMBERSHIP IS LOCAL TO THIS CLIENT"}</span></div>
       </aside>}
     </main>

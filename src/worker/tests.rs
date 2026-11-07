@@ -643,6 +643,49 @@ fn spawn_worker_pair() -> (OscWorkerHandle, OscWorkerHandle) {
 }
 
 #[test]
+fn unicast_worker_replies_from_its_listener_port() {
+    let remote = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let listener_probe = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    let listener_port = listener_probe.local_addr().unwrap().port();
+    drop(listener_probe);
+
+    let mut config = config::Config::default();
+    config.network_mode = NetworkMode::Unicast;
+    config.listener_address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listener_port);
+    config.unicast_destination = Some(SocketAddrV4::new(
+        Ipv4Addr::LOCALHOST,
+        remote.local_addr().unwrap().port(),
+    ));
+    let worker = OscWorkerHandle::spawn(config).unwrap();
+
+    let mut buffer = [0; 2048];
+    let (size, worker_address) = remote.recv_from(&mut buffer).unwrap();
+    let (_, introduction) = decoder::decode_udp(&buffer[..size]).unwrap();
+    assert!(matches!(
+        Message::try_from(introduction).unwrap(),
+        Message::Me(Me::Introduce(_))
+    ));
+    assert_eq!(worker_address.port(), listener_port);
+
+    let query = Message::Who(Who::Listening("stage".to_string()));
+    let query_packet = rosc::encoder::encode(&query.to_osc().unwrap()).unwrap();
+    remote.send_to(&query_packet, worker_address).unwrap();
+
+    let (size, reply_address) = remote.recv_from(&mut buffer).unwrap();
+    let (_, reply) = decoder::decode_udp(&buffer[..size]).unwrap();
+    assert!(matches!(
+        Message::try_from(reply).unwrap(),
+        Message::Me(Me::Listening(_))
+    ));
+    assert_eq!(reply_address.port(), listener_port);
+
+    worker.join().unwrap();
+}
+
+#[test]
 #[ignore = "requires multicast loopback and shared-port support"]
 fn two_workers_exchange_welcomes_over_multicast() {
     let (first, second) = spawn_worker_pair();

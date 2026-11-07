@@ -1,7 +1,8 @@
 use rosc::OscType;
-use rust_osc_io::config::Config;
+use rust_osc_io::config::{Config, DEFAULT_MULTICAST_GROUP, NetworkMode};
 use rust_osc_io::worker::{OscWorkerEvent, OscWorkerHandle};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Mutex, MutexGuard};
@@ -38,6 +39,13 @@ struct ConnectionInfo {
     client_uuid: String,
 }
 
+#[derive(Serialize)]
+struct LocalNetworkInterface {
+    name: String,
+    address: String,
+    is_loopback: bool,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum UiEvent {
@@ -64,8 +72,12 @@ fn connect(
     state: State<'_, AppState>,
     client_name: String,
     client_uuid: Option<String>,
+    network_mode: String,
     multicast_group: String,
+    multicast_interfaces: Vec<String>,
     listener_port: u16,
+    unicast_address: String,
+    unicast_port: u16,
 ) -> Result<ConnectionInfo, String> {
     let mut session = lock_session(&state);
     if let Some(worker) = session.worker.as_ref() {
@@ -78,12 +90,62 @@ fn connect(
     if listener_port == 0 {
         return Err("Listener port must be between 1 and 65535".to_string());
     }
-    let multicast_group = multicast_group
-        .parse::<Ipv4Addr>()
-        .map_err(|_| "Multicast group must be a valid IPv4 address".to_string())?;
-    if !multicast_group.is_multicast() {
-        return Err("Multicast group must be in the IPv4 multicast range".to_string());
-    }
+    let network_mode = match network_mode.as_str() {
+        "multicast" => NetworkMode::Multicast,
+        "unicast" => NetworkMode::Unicast,
+        _ => return Err("Network mode must be multicast or unicast".to_string()),
+    };
+    let multicast_group = if network_mode == NetworkMode::Multicast {
+        let address = multicast_group
+            .parse::<Ipv4Addr>()
+            .map_err(|_| "Multicast group must be a valid IPv4 address".to_string())?;
+        if !address.is_multicast() {
+            return Err("Multicast group must be in the IPv4 multicast range".to_string());
+        }
+        address
+    } else {
+        DEFAULT_MULTICAST_GROUP
+    };
+    let multicast_interfaces = if network_mode == NetworkMode::Multicast {
+        let available_interfaces = if_addrs::get_if_addrs()
+            .map_err(|error| format!("Failed to enumerate local network interfaces: {error}"))?;
+        let available_addresses = available_interfaces
+            .iter()
+            .filter_map(|interface| match &interface.addr {
+                if_addrs::IfAddr::V4(address) => Some(address.ip),
+                if_addrs::IfAddr::V6(_) => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut selected = Vec::new();
+        for value in multicast_interfaces {
+            let address = value
+                .parse::<Ipv4Addr>()
+                .map_err(|_| format!("Invalid multicast interface IPv4 address: {value}"))?;
+            if !available_addresses.contains(&address) {
+                return Err(format!("{address} is not a local IPv4 interface"));
+            }
+            if !selected.contains(&address) {
+                selected.push(address);
+            }
+        }
+        selected
+    } else {
+        Vec::new()
+    };
+    let unicast_destination = if network_mode == NetworkMode::Unicast {
+        if unicast_port == 0 {
+            return Err("Unicast destination port must be between 1 and 65535".to_string());
+        }
+        let address = unicast_address
+            .parse::<Ipv4Addr>()
+            .map_err(|_| "Unicast destination must be a valid IPv4 address".to_string())?;
+        if address.is_multicast() || address.is_unspecified() || address.octets()[0] == 255 {
+            return Err("Unicast destination must be a unicast IPv4 address".to_string());
+        }
+        Some(SocketAddrV4::new(address, unicast_port))
+    } else {
+        None
+    };
 
     let mut config = Config::new(
         Some(multicast_group),
@@ -92,6 +154,9 @@ fn connect(
         Some(client_name),
         Some(application_name()),
     );
+    config.network_mode = network_mode;
+    config.multicast_interfaces = multicast_interfaces;
+    config.unicast_destination = unicast_destination;
     if let Some(client_uuid) = client_uuid.filter(|value| !value.trim().is_empty()) {
         config = config.set_client_uuid(client_uuid);
     }
@@ -113,6 +178,28 @@ fn connect(
     }
 
     Ok(connection_info)
+}
+
+#[tauri::command]
+fn get_network_interfaces() -> Result<Vec<LocalNetworkInterface>, String> {
+    let interfaces = if_addrs::get_if_addrs().map_err(|error| error.to_string())?;
+    let mut result = interfaces
+        .into_iter()
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(address) => Some(LocalNetworkInterface {
+                name: interface.name,
+                address: address.ip.to_string(),
+                is_loopback: address.ip.is_loopback(),
+            }),
+            if_addrs::IfAddr::V6(_) => None,
+        })
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.address.cmp(&right.address))
+    });
+    Ok(result)
 }
 
 #[tauri::command]
@@ -295,6 +382,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             connect,
+            get_network_interfaces,
             disconnect,
             enter_room,
             exit_room,

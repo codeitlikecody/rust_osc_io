@@ -7,6 +7,7 @@ edition = "2024"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+if-addrs = "0.13"
 rust_osc_io = { path = "../.." }
 rosc = "0.11.4"
 serde = { version = "1", features = ["derive"] }

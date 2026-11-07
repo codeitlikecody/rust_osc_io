@@ -14,8 +14,18 @@ pub const DEFAULT_CLIENT_NAME: &str = "OSC Messenger test client";
 
 pub const DEFAULT_WORKER_START_TIMEOUT_MS: Duration = Duration::from_secs(1);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NetworkMode {
+    #[default]
+    Multicast,
+    Unicast,
+}
+
 pub struct Config {
+    pub network_mode: NetworkMode,
     pub multicast_group: Ipv4Addr,
+    pub multicast_interfaces: Vec<Ipv4Addr>,
+    pub unicast_destination: Option<SocketAddrV4>,
     pub listener_address: SocketAddrV4,
     pub sender_address: SocketAddrV4,
     pub client_name: String,
@@ -28,7 +38,10 @@ impl Default for Config {
     /// A new Config instance with the default parameters.
     fn default() -> Self {
         Config {
+            network_mode: NetworkMode::Multicast,
             multicast_group: DEFAULT_MULTICAST_GROUP,
+            multicast_interfaces: Vec::new(),
+            unicast_destination: None,
             listener_address: SocketAddrV4::new(DEFAULT_LISTENER_ADDRESS, DEFAULT_LISTENER_PORT),
             sender_address: SocketAddrV4::new(DEFAULT_SENDER_ADDRESS, DEFAULT_SENDER_PORT),
             client_name: DEFAULT_CLIENT_NAME.to_string(),
@@ -63,7 +76,10 @@ impl Config {
         let application_name = application_name.unwrap_or(default_config.application_name);
 
         Config {
+            network_mode: NetworkMode::Multicast,
             multicast_group,
+            multicast_interfaces: Vec::new(),
+            unicast_destination: None,
             listener_address,
             sender_address,
             client_name,

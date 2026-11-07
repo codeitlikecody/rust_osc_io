@@ -17,15 +17,39 @@ pub fn create_receiver_socket(
     multicast_group: Ipv4Addr,
     listener_address: SocketAddrV4,
 ) -> Result<UdpSocket, io::Error> {
+    create_receiver_socket_with_interfaces(multicast_group, listener_address, &[])
+}
+
+pub fn create_receiver_socket_with_interfaces(
+    multicast_group: Ipv4Addr,
+    listener_address: SocketAddrV4,
+    interfaces: &[Ipv4Addr],
+) -> Result<UdpSocket, io::Error> {
+    let socket = create_bound_receiver_socket(listener_address)?;
+    if interfaces.is_empty() {
+        socket.join_multicast_v4(&multicast_group, &listener_address.ip())?;
+    } else {
+        for interface in interfaces {
+            socket.join_multicast_v4(&multicast_group, interface)?;
+        }
+    }
+    socket.set_multicast_loop_v4(true)?;
+    Ok(socket)
+}
+
+pub fn create_unicast_receiver_socket(
+    listener_address: SocketAddrV4,
+) -> Result<UdpSocket, io::Error> {
+    create_bound_receiver_socket(listener_address)
+}
+
+fn create_bound_receiver_socket(listener_address: SocketAddrV4) -> Result<UdpSocket, io::Error> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     #[cfg(unix)]
     socket.set_reuse_port(true)?;
     socket.bind(&listener_address.into())?;
-    let socket: UdpSocket = socket.into();
-    socket.join_multicast_v4(&multicast_group, &listener_address.ip())?;
-    socket.set_multicast_loop_v4(true)?;
-    Ok(socket)
+    Ok(socket.into())
 }
 
 /// Leaves the multicast group and closes the socket.
@@ -75,6 +99,14 @@ pub fn send_osc_message(
     };
     // Create a sender socket to send the message
 
+    send_osc_message_from_socket(&socket, destination_address, message)
+}
+
+pub fn send_osc_message_from_socket(
+    socket: &UdpSocket,
+    destination_address: SocketAddrV4,
+    message: Message,
+) -> Result<usize, OscWorkerError> {
     let message_osc = match message.to_osc() {
         Ok(message) => message,
         Err(error) => {

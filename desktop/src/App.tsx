@@ -38,6 +38,7 @@ type ChatMessage = {
 
 type Contact = { id: string; name: string; application: string };
 type LocalNetworkInterface = { name: string; address: string; is_loopback: boolean };
+type GatewayUiStatus = { state: string; gateway_uuid: string | null; detail: string | null };
 
 type SavedIdentity = {
   clientName: string;
@@ -57,6 +58,8 @@ type Preferences = {
   density: "comfortable" | "compact";
   reduceMotion: boolean;
   autoConnect: boolean;
+  gatewayEnabled: boolean;
+  gatewayConflictPolicy: "start_anyway" | "stop_local" | "never_start";
   enterToSend: boolean;
   showTimestamps: boolean;
   showPeerApplications: boolean;
@@ -81,6 +84,8 @@ const DEFAULT_PREFERENCES: Preferences = {
   density: "comfortable",
   reduceMotion: false,
   autoConnect: true,
+  gatewayEnabled: true,
+  gatewayConflictPolicy: "stop_local",
   enterToSend: true,
   showTimestamps: true,
   showPeerApplications: true,
@@ -173,6 +178,10 @@ function loadPreferences(): Preferences {
       density: parsed.density === "compact" ? "compact" : "comfortable",
       reduceMotion: parsed.reduceMotion === true,
       autoConnect: parsed.autoConnect !== false,
+      gatewayEnabled: parsed.gatewayEnabled !== false,
+      gatewayConflictPolicy: parsed.gatewayConflictPolicy === "start_anyway" || parsed.gatewayConflictPolicy === "never_start"
+        ? parsed.gatewayConflictPolicy
+        : "stop_local",
       enterToSend: parsed.enterToSend !== false,
       showTimestamps: parsed.showTimestamps !== false,
       showPeerApplications: parsed.showPeerApplications !== false,
@@ -228,6 +237,7 @@ export default function App() {
   const [preferences, setPreferences] = useState(loadPreferences);
   const [networkInterfaces, setNetworkInterfaces] = useState<LocalNetworkInterface[]>([]);
   const [networkInterfaceError, setNetworkInterfaceError] = useState("");
+  const [gatewayStatus, setGatewayStatus] = useState<GatewayUiStatus>({ state: "checking", gateway_uuid: null, detail: null });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsError, setSettingsError] = useState("");
   const [connected, setConnected] = useState(false);
@@ -247,6 +257,7 @@ export default function App() {
   const transcriptRef = useRef<HTMLDivElement>(null);
   const startupConnectionAttempted = useRef(false);
   const connectInProgress = useRef(false);
+  const gatewayStartupConfigured = useRef(false);
 
   useEffect(() => {
     localStorage.setItem(IDENTITY_KEY, JSON.stringify(identity));
@@ -277,6 +288,24 @@ export default function App() {
       active = false;
     };
   }, [settingsOpen, preferences.networkMode]);
+
+  useEffect(() => {
+    if (!desktopBridgeAvailable) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void listen<GatewayUiStatus>("gateway-status", ({ payload }) => {
+      if (active) setGatewayStatus(payload);
+    }).then((stop) => {
+      if (active) unlisten = stop;
+      else stop();
+    }).catch((error: unknown) => {
+      if (active) setGatewayStatus({ state: "error", gateway_uuid: null, detail: String(error) });
+    });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     if (!desktopBridgeAvailable) return;
@@ -395,8 +424,9 @@ export default function App() {
     setSettingsError("");
   }
 
-  async function multicastInterfaceAddressesFor(settings: Preferences) {
-    if (settings.networkMode !== "multicast" || settings.interfaceMode === "default") return [];
+  async function multicastInterfaceAddressesFor(settings: Preferences, forGateway = false) {
+    if (!forGateway && settings.networkMode !== "multicast") return [];
+    if (settings.interfaceMode === "default") return [];
     if (settings.interfaceMode === "selected") return settings.multicastInterfaces;
     const interfaces = networkInterfaces.length > 0
       ? networkInterfaces
@@ -404,6 +434,35 @@ export default function App() {
     if (interfaces.length === 0) throw new Error("No IPv4 network interfaces are available.");
     return interfaces.map((networkInterface) => networkInterface.address);
   }
+
+  async function configureGateway(settings: Preferences) {
+    const multicastInterfaces = settings.gatewayEnabled
+      ? await multicastInterfaceAddressesFor(settings, true)
+      : [];
+    if (settings.gatewayEnabled && settings.interfaceMode === "selected" && multicastInterfaces.length === 0) {
+      throw new Error("Choose at least one interface for the local Gateway.");
+    }
+    await invoke("configure_gateway", {
+      enabled: settings.gatewayEnabled,
+      conflictPolicy: settings.gatewayConflictPolicy,
+      multicastGroup: settings.multicastGroup.trim(),
+      multicastInterfaces,
+      listenerPort: Number(settings.listenerPort),
+    });
+    if (!settings.gatewayEnabled || settings.gatewayConflictPolicy === "never_start") {
+      setGatewayStatus({ state: "disabled", gateway_uuid: null, detail: "Local Gateway disabled by settings." });
+    } else {
+      setGatewayStatus({ state: "checking", gateway_uuid: null, detail: null });
+    }
+  }
+
+  useEffect(() => {
+    if (!desktopBridgeAvailable || gatewayStartupConfigured.current) return;
+    gatewayStartupConfigured.current = true;
+    void configureGateway(preferences).catch((error: unknown) => {
+      setGatewayStatus({ state: "error", gateway_uuid: null, detail: String(error) });
+    });
+  }, []);
 
   async function connect() {
     if (!desktopBridgeAvailable || connected || connectInProgress.current) return;
@@ -510,6 +569,13 @@ export default function App() {
 
     const nextPreferences = { ...preferences, multicastGroup, listenerPort, unicastAddress, unicastPort };
     const nextIdentity = { ...identity, clientName };
+      const gatewayChanged = 
+        nextPreferences.gatewayEnabled !== preferences.gatewayEnabled || 
+        nextPreferences.gatewayConflictPolicy !== preferences.gatewayConflictPolicy || 
+        nextPreferences.multicastGroup !== preferences.multicastGroup || 
+        nextPreferences.listenerPort !== preferences.listenerPort || 
+        nextPreferences.interfaceMode !== preferences.interfaceMode || 
+        nextPreferences.multicastInterfaces.join(",") !== preferences.multicastInterfaces.join(","); 
     const reconnect = connected && (
       nextPreferences.networkMode !== preferences.networkMode ||
       nextPreferences.interfaceMode !== preferences.interfaceMode ||
@@ -524,6 +590,15 @@ export default function App() {
     setPreferences(nextPreferences);
     setIdentity(nextIdentity);
     setSettingsOpen(false);
+
+    if (desktopBridgeAvailable && (gatewayChanged || !gatewayStartupConfigured.current)) {
+      try {
+        await configureGateway(nextPreferences);
+        gatewayStartupConfigured.current = true;
+      } catch (error) {
+        setGatewayStatus({ state: "error", gateway_uuid: null, detail: String(error) });
+      }
+    }
 
     if (!reconnect) return;
     connectInProgress.current = true;
@@ -737,12 +812,19 @@ export default function App() {
             </section>
 
             <section className="settings-group">
-              <div className="settings-group-heading"><span className="settings-index">04</span><div><h2>Room history</h2><p>Recently joined rooms are stored on this device.</p></div></div>
+              <div className="settings-group-heading"><span className="settings-index">04</span><div><h2>Gateway server</h2><p>Make this client available to TCP Gateway patrons.</p></div></div>
+              <label className="settings-toggle-row"><span className="settings-toggle-copy"><strong>Manage a local Gateway</strong><small>Check for an active Gateway and start a local one if needed.</small></span><input type="checkbox" checked={preferences.gatewayEnabled} onChange={(event) => updatePreference("gatewayEnabled", event.target.checked)} /><span className="settings-toggle-track" aria-hidden="true" /></label>
+              <label className="gateway-policy-field"><span>If another Gateway is active</span><select value={preferences.gatewayConflictPolicy} onChange={(event) => updatePreference("gatewayConflictPolicy", event.target.value as Preferences["gatewayConflictPolicy"])} disabled={!preferences.gatewayEnabled}><option value="start_anyway">Start anyway</option><option value="stop_local">Stop local server</option><option value="never_start">Never start local server</option></select></label>
+              <div className="gateway-status-row"><span>Gateway status</span><strong className={`gateway-status-${gatewayStatus.state}`}>{!desktopBridgeAvailable ? "Native client required" : gatewayStatus.detail || ({ checking: "Checking network…", local_active: "Local Gateway active", remote_active: "Using another Gateway", disabled: "Local Gateway disabled", stopped: "Local Gateway stopped", error: "Gateway error", discovery_error: "Gateway discovery failed" }[gatewayStatus.state] ?? gatewayStatus.state)}</strong></div>
+            </section>
+
+            <section className="settings-group">
+              <div className="settings-group-heading"><span className="settings-index">05</span><div><h2>Room history</h2><p>Recently joined rooms are stored on this device.</p></div></div>
               <div className="history-clear-row"><div><strong>Recent rooms</strong><small>{recentRooms.length} of {MAX_RECENT_ROOMS} saved</small></div><button type="button" className="reset-network-button" disabled={recentRooms.length === 0} onClick={() => setRecentRooms([])}>Clear recent rooms</button></div>
             </section>
 
             <details className="settings-group advanced-network-settings">
-              <summary className="settings-group-heading"><span className="settings-index">05</span><div><h2>Advanced settings</h2><p>Only change network settings if you understand your setup.</p></div></summary>
+              <summary className="settings-group-heading"><span className="settings-index">06</span><div><h2>Advanced settings</h2><p>Only change network settings if you understand your setup.</p></div></summary>
               <div className="advanced-settings-content">
                 <p className="advanced-warning">Only change these settings if you understand your network setup. Incorrect values can prevent the client from connecting.</p>
                 <div className="settings-option-block transport-choice"><span className="settings-option-label">Connection mode</span><div className="segmented-control"><button type="button" aria-pressed={preferences.networkMode === "multicast"} onClick={() => updatePreference("networkMode", "multicast")}><RadioTower size={15} /> Multicast</button><button type="button" aria-pressed={preferences.networkMode === "unicast"} onClick={() => updatePreference("networkMode", "unicast")}><Cable size={15} /> Unicast</button></div></div>

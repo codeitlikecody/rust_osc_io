@@ -1,12 +1,13 @@
 use rosc::OscType;
 use rust_osc_io::config::{Config, DEFAULT_MULTICAST_GROUP, NetworkMode};
+use rust_osc_io::gateway::{GatewayConfig, discover_active_gateways, run_gateway};
 use rust_osc_io::worker::{OscWorkerEvent, OscWorkerHandle};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::{Mutex, MutexGuard};
-use std::thread;
+use std::sync::{Mutex, MutexGuard, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -32,6 +33,26 @@ struct Session {
 #[derive(Default)]
 struct AppState {
     session: Mutex<Session>,
+    gateway: Mutex<Option<GatewayRuntime>>,
+}
+
+struct GatewayRuntime {
+    shutdown: mpsc::Sender<()>,
+    thread: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GatewayConflictPolicy {
+    StartAnyway,
+    StopLocalServer,
+    NeverStartLocalServer,
+}
+
+#[derive(Clone, Serialize)]
+struct GatewayStatus {
+    state: String,
+    gateway_uuid: Option<String>,
+    detail: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -203,6 +224,82 @@ fn get_network_interfaces() -> Result<Vec<LocalNetworkInterface>, String> {
 }
 
 #[tauri::command]
+fn configure_gateway(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+    conflict_policy: String,
+    multicast_group: String,
+    multicast_interfaces: Vec<String>,
+    listener_port: u16,
+) -> Result<(), String> {
+    stop_gateway_runtime(&state);
+    if !enabled {
+        emit_gateway_status(&app, "disabled", None, None);
+        return Ok(());
+    }
+
+    let policy = match conflict_policy.as_str() {
+        "start_anyway" => GatewayConflictPolicy::StartAnyway,
+        "stop_local" => GatewayConflictPolicy::StopLocalServer,
+        "never_start" => GatewayConflictPolicy::NeverStartLocalServer,
+        _ => return Err("Invalid Gateway conflict policy".to_string()),
+    };
+    if policy == GatewayConflictPolicy::NeverStartLocalServer {
+        emit_gateway_status(&app, "disabled", None, None);
+        return Ok(());
+    }
+    if listener_port == 0 {
+        return Err("Gateway listener port must be between 1 and 65535".to_string());
+    }
+
+    let multicast_group = multicast_group
+        .parse::<Ipv4Addr>()
+        .map_err(|_| "Gateway multicast group must be a valid IPv4 address".to_string())?;
+    if !multicast_group.is_multicast() {
+        return Err("Gateway group must be in the IPv4 multicast range".to_string());
+    }
+    let available_addresses = if_addrs::get_if_addrs()
+        .map_err(|error| format!("Failed to enumerate local network interfaces: {error}"))?
+        .into_iter()
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(address) => Some(address.ip),
+            if_addrs::IfAddr::V6(_) => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut selected_interfaces = Vec::new();
+    for value in multicast_interfaces {
+        let address = value
+            .parse::<Ipv4Addr>()
+            .map_err(|_| format!("Invalid Gateway interface IPv4 address: {value}"))?;
+        if !available_addresses.contains(&address) {
+            return Err(format!("{address} is not a local IPv4 interface"));
+        }
+        if !selected_interfaces.contains(&address) {
+            selected_interfaces.push(address);
+        }
+    }
+
+    let mut gateway_config = GatewayConfig::default();
+    gateway_config.multicast_group = multicast_group;
+    gateway_config.multicast_interfaces = selected_interfaces;
+    gateway_config.multicast_listener_address =
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listener_port);
+    let (shutdown, shutdown_rx) = mpsc::channel();
+    let gateway_app = app.clone();
+    let thread = thread::Builder::new()
+        .name("gateway-supervisor".to_string())
+        .spawn(move || run_gateway_supervisor(gateway_app, gateway_config, policy, shutdown_rx))
+        .map_err(|error| error.to_string())?;
+    let mut runtime = state
+        .gateway
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *runtime = Some(GatewayRuntime { shutdown, thread });
+    Ok(())
+}
+
+#[tauri::command]
 fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
     let worker = {
         let mut session = lock_session(&state);
@@ -370,6 +467,161 @@ fn start_event_pump(app: AppHandle) -> io::Result<()> {
         .map(|_| ())
 }
 
+fn run_gateway_supervisor(
+    app: AppHandle,
+    config: GatewayConfig,
+    policy: GatewayConflictPolicy,
+    shutdown: mpsc::Receiver<()>,
+) {
+    emit_gateway_status(&app, "checking", None, None);
+    let active_gateways = discover_active_gateways(&config, Duration::from_secs(1));
+    let remote_gateway = match active_gateways {
+        Ok(gateways) => gateways.into_iter().next(),
+        Err(error) => {
+            if policy == GatewayConflictPolicy::StopLocalServer {
+                emit_gateway_status(
+                    &app,
+                    "discovery_error",
+                    None,
+                    Some(format!("Could not check for another Gateway: {error}")),
+                );
+                return;
+            }
+            None
+        }
+    };
+
+    if let Some(gateway_uuid) = remote_gateway.as_ref()
+        && policy == GatewayConflictPolicy::StopLocalServer
+    {
+        emit_gateway_status(
+            &app,
+            "remote_active",
+            Some(gateway_uuid.clone()),
+            Some("Using the active Gateway; no local server was started.".to_string()),
+        );
+        return;
+    }
+
+    let local_gateway_uuid = config.gateway_uuid.clone();
+    let (gateway_shutdown, gateway_shutdown_rx) = mpsc::channel();
+    let server_config = config.clone();
+    let server = match thread::Builder::new()
+        .name("local-gateway-server".to_string())
+        .spawn(move || run_gateway(server_config, gateway_shutdown_rx))
+    {
+        Ok(server) => server,
+        Err(error) => {
+            emit_gateway_status(
+                &app,
+                "error",
+                None,
+                Some(format!("Could not start the local Gateway: {error}")),
+            );
+            return;
+        }
+    };
+
+    emit_gateway_status(
+        &app,
+        "local_active",
+        Some(local_gateway_uuid.clone()),
+        remote_gateway
+            .map(|uuid| format!("Local Gateway started alongside active Gateway {uuid}.")),
+    );
+
+    loop {
+        if server.is_finished() {
+            match server.join() {
+                Ok(Ok(())) => emit_gateway_status(&app, "stopped", Some(local_gateway_uuid), None),
+                Ok(Err(error)) => emit_gateway_status(
+                    &app,
+                    "error",
+                    Some(local_gateway_uuid),
+                    Some(format!("Local Gateway stopped: {error}")),
+                ),
+                Err(_) => emit_gateway_status(
+                    &app,
+                    "error",
+                    Some(local_gateway_uuid),
+                    Some("Local Gateway thread panicked.".to_string()),
+                ),
+            }
+            return;
+        }
+
+        match shutdown.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                let _ = gateway_shutdown.send(());
+                let _ = server.join();
+                emit_gateway_status(&app, "stopped", Some(local_gateway_uuid), None);
+                return;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        if policy == GatewayConflictPolicy::StopLocalServer {
+            if let Ok(gateways) = discover_active_gateways(&config, Duration::from_millis(750))
+                && let Some(remote_uuid) = gateways
+                    .into_iter()
+                    .find(|uuid| uuid != &local_gateway_uuid)
+            {
+                let _ = gateway_shutdown.send(());
+                let _ = server.join();
+                emit_gateway_status(
+                    &app,
+                    "remote_active",
+                    Some(remote_uuid.clone()),
+                    Some(format!(
+                        "Stopped local Gateway because Gateway {remote_uuid} became active."
+                    )),
+                );
+                return;
+            }
+        } else {
+            match shutdown.recv_timeout(Duration::from_millis(750)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = gateway_shutdown.send(());
+                    let _ = server.join();
+                    emit_gateway_status(&app, "stopped", Some(local_gateway_uuid), None);
+                    return;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+}
+
+fn emit_gateway_status(
+    app: &AppHandle,
+    state: &str,
+    gateway_uuid: Option<String>,
+    detail: Option<String>,
+) {
+    let _ = app.emit(
+        "gateway-status",
+        GatewayStatus {
+            state: state.to_string(),
+            gateway_uuid,
+            detail,
+        },
+    );
+}
+
+fn stop_gateway_runtime(state: &AppState) {
+    let runtime = state
+        .gateway
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(runtime) = runtime {
+        let _ = runtime.shutdown.send(());
+        if runtime.thread.join().is_err() {
+            eprintln!("Gateway supervisor thread panicked during shutdown");
+        }
+    }
+}
+
 fn lock_session(state: &AppState) -> MutexGuard<'_, Session> {
     state
         .session
@@ -383,6 +635,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .invoke_handler(tauri::generate_handler![
             connect,
             get_network_interfaces,
+            configure_gateway,
             disconnect,
             enter_room,
             exit_room,
@@ -395,6 +648,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(worker) = lock_session(&state).worker.take() {
                     let _ = worker.join();
                 }
+                stop_gateway_runtime(&state);
             }
         })
         .run(tauri::generate_context!())?;

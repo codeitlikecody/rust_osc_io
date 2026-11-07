@@ -1010,6 +1010,91 @@ textarea:focus-visible {
     font-size: 10px;
 }
 
+.gateway-policy-field {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(170px, 200px);
+    align-items: center;
+    gap: 16px;
+    min-height: 58px;
+    padding: 10px 0;
+    border-top: 1px solid #242d28;
+}
+
+.gateway-policy-field>span,
+.gateway-status-row>span {
+    color: #a4afa6;
+    font-size: 10px;
+}
+
+.gateway-policy-field select {
+    width: 100%;
+    min-width: 0;
+    height: 36px;
+    padding: 0 10px;
+    color: #e2e8e2;
+    color-scheme: dark;
+    background: #101512;
+    border: 1px solid #344037;
+    border-radius: 3px;
+    font-size: 11px;
+}
+
+.gateway-policy-field select:disabled {
+    opacity: .5;
+}
+
+.gateway-status-row {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 5px;
+    min-height: 48px;
+    padding: 10px 0;
+    border-top: 1px solid #242d28;
+}
+
+.gateway-status-row strong {
+    max-width: 100%;
+    color: #d3dbd4;
+    font-size: 10px;
+    font-weight: 500;
+    overflow-wrap: anywhere;
+}
+
+.gateway-status-local_active {
+    color: var(--green) !important;
+}
+
+.gateway-status-remote_active {
+    color: #9ed5cf !important;
+}
+
+.gateway-status-error,
+.gateway-status-discovery_error {
+    color: #e7a879 !important;
+}
+
+.app-shell[data-theme="light"] .gateway-policy-field,
+.app-shell[data-theme="light"] .gateway-status-row {
+    border-color: #d6ded7;
+}
+
+.app-shell[data-theme="light"] .gateway-policy-field>span,
+.app-shell[data-theme="light"] .gateway-status-row>span {
+    color: #647168;
+}
+
+.app-shell[data-theme="light"] .gateway-policy-field select {
+    color: #26332a;
+    color-scheme: light;
+    background: #fff;
+    border-color: #cbd5cc;
+}
+
+.app-shell[data-theme="light"] .gateway-status-row strong {
+    color: #39483e;
+}
+
 .advanced-network-settings {
     margin-top: 14px;
     border-top: 1px solid #29332d;
@@ -2006,6 +2091,11 @@ textarea:focus-visible {
     .settings-field-grid {
         grid-template-columns: minmax(0, 1fr) 100px;
         gap: 8px;
+    }
+
+    .gateway-policy-field {
+        grid-template-columns: minmax(0, 1fr) minmax(160px, 190px);
+        gap: 10px;
     }
 
     .interface-list {

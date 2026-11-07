@@ -191,6 +191,21 @@ fn does_not_welcome_non_introduction_messages() {
 }
 
 #[test]
+fn ignores_gateway_control_packets_in_worker() {
+    let active_gateway = rosc::OscPacket::Message(rosc::OscMessage {
+        addr: "/messenger/gateway/who/active".to_string(),
+        args: vec![OscType::String("gateway-id".to_string())],
+    });
+    let chat_message = rosc::OscPacket::Message(rosc::OscMessage {
+        addr: "/messenger/me/say".to_string(),
+        args: vec![],
+    });
+
+    assert!(is_gateway_control_packet(&active_gateway));
+    assert!(!is_gateway_control_packet(&chat_message));
+}
+
+#[test]
 fn global_say_is_delivered_only_to_clients_outside_rooms() {
     let say = Message::Me(Me::Say(Say::new("sender".to_string(), "hello".to_string())));
 

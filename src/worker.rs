@@ -464,6 +464,7 @@ fn spawn_osc_worker(
         // Receive an OSC packet from the socket
         match socket.recv_from(&mut buffer) {
             Ok((size, sender)) => match decoder::decode_udp(&buffer[..size]) {
+                Ok((_, packet)) if is_gateway_control_packet(&packet) => continue,
                 Ok((_, packet)) => match packet.try_into() {
                     Ok(message) => {
                         let deliver_message =
@@ -568,6 +569,13 @@ fn notify_stopped(events: &WorkerEventSender) {
     events
         .send(OscWorkerEvent::Stopped)
         .unwrap_or_else(|e| eprintln!("WORKER: Failed to send stopped event: {e}"));
+}
+
+fn is_gateway_control_packet(packet: &rosc::OscPacket) -> bool {
+    match packet {
+        rosc::OscPacket::Message(message) => message.addr.starts_with("/messenger/gateway/"),
+        rosc::OscPacket::Bundle(bundle) => bundle.content.iter().all(is_gateway_control_packet),
+    }
 }
 
 fn send_farewell(

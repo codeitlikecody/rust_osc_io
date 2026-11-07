@@ -1,5 +1,5 @@
 use crate::config;
-use crate::net::{create_receiver_socket, create_sender_socket};
+use crate::net::{create_receiver_socket_with_interfaces, create_sender_socket};
 use crate::protocol::validate_uuid;
 use rosc::{OscBundle, OscMessage, OscPacket, OscType, decoder, encoder};
 use std::collections::{HashMap, VecDeque};
@@ -39,6 +39,7 @@ pub struct GatewayConfig {
     pub gateway_uuid: String,
     pub listen_address: SocketAddr,
     pub multicast_group: Ipv4Addr,
+    pub multicast_interfaces: Vec<Ipv4Addr>,
     pub multicast_listener_address: SocketAddrV4,
     pub multicast_sender_address: SocketAddrV4,
     pub max_patrons: usize,
@@ -50,6 +51,7 @@ impl Default for GatewayConfig {
             gateway_uuid: uuid::Uuid::new_v4().to_string().to_uppercase(),
             listen_address: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, GATEWAY_PORT).into(),
             multicast_group: config::DEFAULT_MULTICAST_GROUP,
+            multicast_interfaces: Vec::new(),
             multicast_listener_address: SocketAddrV4::new(
                 config::DEFAULT_LISTENER_ADDRESS,
                 config::DEFAULT_LISTENER_PORT,
@@ -110,8 +112,11 @@ pub fn run_gateway(config: GatewayConfig, shutdown: Receiver<()>) -> io::Result<
 
     let listener = TcpListener::bind(config.listen_address)?;
     listener.set_nonblocking(true)?;
-    let multicast_receiver =
-        create_receiver_socket(config.multicast_group, config.multicast_listener_address)?;
+    let multicast_receiver = create_receiver_socket_with_interfaces(
+        config.multicast_group,
+        config.multicast_listener_address,
+        &config.multicast_interfaces,
+    )?;
     multicast_receiver.set_read_timeout(Some(MULTICAST_POLL_INTERVAL))?;
     let multicast_sender = create_sender_socket(config.multicast_sender_address)?;
     let multicast_sender_port = multicast_sender.local_addr()?.port();
@@ -139,6 +144,7 @@ pub fn run_gateway(config: GatewayConfig, shutdown: Receiver<()>) -> io::Result<
         "Gateway {} listening on {}",
         shared.gateway_uuid, config.listen_address
     );
+    send_gateway_discovery_beacon(&shared);
 
     let run_result = 'run: loop {
         match shutdown.try_recv() {
@@ -194,6 +200,7 @@ pub fn run_gateway(config: GatewayConfig, shutdown: Receiver<()>) -> io::Result<
         if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
             let active = string_message(WHO_ACTIVE, &[&shared.gateway_uuid]);
             broadcast_packet(&shared, &active, None);
+            send_gateway_discovery_beacon(&shared);
             last_keepalive = Instant::now();
         }
         disconnect_expired_patrons(&shared);
@@ -207,12 +214,105 @@ pub fn run_gateway(config: GatewayConfig, shutdown: Receiver<()>) -> io::Result<
             eprintln!("Patron connection thread panicked during shutdown");
         }
     }
-    crate::net::leave_multicast_group(
+    leave_gateway_multicast(
         &multicast_receiver,
         config.multicast_group,
+        &config.multicast_interfaces,
         config.multicast_listener_address.ip(),
     )?;
     run_result
+}
+
+pub fn discover_active_gateways(
+    config: &GatewayConfig,
+    timeout: Duration,
+) -> io::Result<Vec<String>> {
+    let receiver = create_receiver_socket_with_interfaces(
+        config.multicast_group,
+        config.multicast_listener_address,
+        &config.multicast_interfaces,
+    )?;
+    let discovery = (|| {
+        let sender = create_sender_socket(config.multicast_sender_address)?;
+        let destination = SocketAddrV4::new(
+            config.multicast_group,
+            config.multicast_listener_address.port(),
+        );
+        let query = string_message(WHO_ACTIVE, &[]);
+        let bytes = encoder::encode(&query)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        sender.send_to(&bytes, destination)?;
+
+        let deadline = Instant::now() + timeout;
+        let mut active_gateways = Vec::new();
+        let mut buffer = [0u8; 4096];
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            receiver.set_read_timeout(Some(remaining.min(MULTICAST_POLL_INTERVAL)))?;
+            match receiver.recv_from(&mut buffer) {
+                Ok((size, _)) => {
+                    if let Ok(([], packet)) = decoder::decode_udp(&buffer[..size])
+                        && let Some(gateway_uuid) = active_gateway_uuid(&packet)
+                        && !active_gateways.contains(&gateway_uuid)
+                    {
+                        active_gateways.push(gateway_uuid);
+                    }
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.kind() == io::ErrorKind::TimedOut
+                        || error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(active_gateways)
+    })();
+    let leave_result = leave_gateway_multicast(
+        &receiver,
+        config.multicast_group,
+        &config.multicast_interfaces,
+        config.multicast_listener_address.ip(),
+    );
+    match discovery {
+        Ok(active_gateways) => {
+            leave_result?;
+            Ok(active_gateways)
+        }
+        Err(error) => {
+            let _ = leave_result;
+            Err(error)
+        }
+    }
+}
+
+fn leave_gateway_multicast(
+    socket: &UdpSocket,
+    multicast_group: Ipv4Addr,
+    multicast_interfaces: &[Ipv4Addr],
+    default_interface: &Ipv4Addr,
+) -> io::Result<()> {
+    if multicast_interfaces.is_empty() {
+        crate::net::leave_multicast_group(socket, multicast_group, default_interface)?;
+    } else {
+        for interface in multicast_interfaces {
+            crate::net::leave_multicast_group(socket, multicast_group, interface)?;
+        }
+    }
+    Ok(())
+}
+
+fn send_gateway_discovery_beacon(shared: &GatewayShared) {
+    let packet = string_message(WHO_ACTIVE, &[&shared.gateway_uuid]);
+    match encoder::encode(&packet) {
+        Ok(bytes) => match shared
+            .multicast_sender
+            .send_to(&bytes, shared.multicast_destination)
+        {
+            Ok(_) => remember_loopback_packet(shared, shared.multicast_sender_port, bytes),
+            Err(error) => eprintln!("Failed to send gateway discovery beacon: {error}"),
+        },
+        Err(error) => eprintln!("Failed to encode gateway discovery beacon: {error}"),
+    }
 }
 
 fn handle_patron_connection(
@@ -444,6 +544,10 @@ fn forward_multicast_datagram(shared: &Arc<GatewayShared>, sender: SocketAddr, b
     }
     match decoder::decode_udp(bytes) {
         Ok((_, packet)) => {
+            if is_gateway_active_query(&packet) {
+                send_gateway_discovery_beacon(shared);
+                return;
+            }
             if let Some(packet) = filter_gateway_messages(&packet) {
                 broadcast_packet(shared, &packet, None);
             }
@@ -524,7 +628,7 @@ fn remove_patron(shared: &Arc<GatewayShared>, patron_id: u64) {
     }
 }
 
-fn remember_loopback_packet(shared: &Arc<GatewayShared>, source_port: u16, bytes: Vec<u8>) {
+fn remember_loopback_packet(shared: &GatewayShared, source_port: u16, bytes: Vec<u8>) {
     let mut cache = lock(&shared.loopback_packets);
     let now = Instant::now();
     cache.retain(|entry| now.duration_since(entry.received_at) < LOOPBACK_CACHE_WINDOW);
@@ -696,6 +800,21 @@ fn string_message(address: &str, values: &[&str]) -> OscPacket {
     })
 }
 
+fn is_gateway_active_query(packet: &OscPacket) -> bool {
+    packet_message(packet)
+        .is_some_and(|message| message.addr == WHO_ACTIVE && message.args.is_empty())
+}
+
+fn active_gateway_uuid(packet: &OscPacket) -> Option<String> {
+    let message = packet_message(packet)?;
+    if message.addr != WHO_ACTIVE {
+        return None;
+    }
+    let uuid = string_argument(&message.args)?;
+    validate_uuid(&uuid).ok()?;
+    Some(uuid)
+}
+
 fn filter_gateway_messages(packet: &OscPacket) -> Option<OscPacket> {
     match packet {
         OscPacket::Message(message) => {
@@ -798,6 +917,48 @@ mod tests {
     fn gateway_request_parses_patron_uuid() {
         let packet = string_message(REQUEST, &["patron-id"]);
         assert_eq!(parse_gateway_request(&packet).unwrap(), "patron-id");
+    }
+
+    #[test]
+    fn gateway_active_probe_and_beacon_are_distinguishable() {
+        let gateway_uuid = "B0BAE0A0-3BBE-4004-888B-F61CA125D0B0";
+        let query = string_message(WHO_ACTIVE, &[]);
+        let beacon = string_message(WHO_ACTIVE, &[gateway_uuid]);
+
+        assert!(is_gateway_active_query(&query));
+        assert!(!is_gateway_active_query(&beacon));
+        assert_eq!(active_gateway_uuid(&beacon), Some(gateway_uuid.to_string()));
+        assert_eq!(active_gateway_uuid(&query), None);
+        assert_eq!(
+            active_gateway_uuid(&string_message(WHO_ACTIVE, &["invalid"])),
+            None
+        );
+    }
+
+    #[test]
+    fn gateway_answers_active_query_immediately() {
+        let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let destination =
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver.local_addr().unwrap().port());
+        let shared = test_shared(1, destination);
+        let query = encoder::encode(&string_message(WHO_ACTIVE, &[])).unwrap();
+
+        forward_multicast_datagram(
+            &shared,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40_000).into(),
+            &query,
+        );
+
+        let mut buffer = [0; 1024];
+        let (size, _) = receiver.recv_from(&mut buffer).unwrap();
+        let (_, packet) = decoder::decode_udp(&buffer[..size]).unwrap();
+        assert_eq!(
+            active_gateway_uuid(&packet),
+            Some(shared.gateway_uuid.clone())
+        );
     }
 
     #[test]
@@ -1020,6 +1181,7 @@ mod tests {
             gateway_uuid: "B0BAE0A0-3BBE-4004-888B-F61CA125D0B0".to_string(),
             listen_address,
             multicast_group: config::DEFAULT_MULTICAST_GROUP,
+            multicast_interfaces: Vec::new(),
             multicast_listener_address,
             multicast_sender_address: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
             max_patrons: 1,
